@@ -272,17 +272,27 @@ TESTEOF
 
     sed -i "s|HELPERS_PATH|$helpers|" "$tmp"
 
-    sh "$tmp" 2>&1 | while IFS= read -r line; do
+    # Run the driver to a RESULT FILE, then consume tokens in the CURRENT shell
+    # (while read < file — NO pipe) so pass/fail/skip mutate the real counters.
+    local h_out="/tmp/test-helpers-out-$$.log"
+    sh "$tmp" > "$h_out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
+    done < "$h_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "helpers-driver-completed:OK"
+    else
+        fail "helpers-driver-completed:FAIL (driver aborted early)"
+    fi
 
-    rm -f "$tmp"
+    rm -f "$tmp" "$h_out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -911,19 +921,30 @@ fi
 
 # Emit the generated route (with mark) for the caller to build a full config.
 echo "$with" | jq -c 'del(.route.rules[]?.__service_tag) | .route' > "ROUTE_JSON"
+echo 'DONE'
 SIEOF
     local route_json="/tmp/si-route-$$.json"
     sed -i "s#CONST_LIB#$const_lib#g; s#CM_LIB#$cm_lib#g; s#ROUTE_JSON#$route_json#g" "$drv"
 
     rm -f "$route_json"
-    local out
-    out="$(ash "$drv" 2>&1 || true)"
-    echo "$out" | while IFS= read -r line; do
+    # Tokens go to a FILE (no pipe): pass/fail must run in this shell or the
+    # counter increments are lost in the pipeline subshell.
+    local out="/tmp/si-driver-out-$$.log"
+    ash "$drv" > "$out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:FAIL*) fail "$line" ;;
             *:OK*)   pass "$line" ;;
+            DONE)    saw_done=1 ;;
         esac
-    done
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "si-driver-completed:OK"
+    else
+        fail "si-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$out"
 
     # ── (b) 2-section config (section 2 unreachable) + generated route: check ──
     local mark_dec
@@ -1055,6 +1076,7 @@ test_unsupported_skip() {
     ln -sf "$lib/sing_box_config_manager.sh" /usr/lib/netshift/sing_box_config_manager.sh
 
     local drv="/tmp/test-unsupported-skip-$$.sh"
+    local out="/tmp/test-unsupported-skip-out-$$.txt"
     cat > "$drv" << 'USEOF'
 . "CONST_LIB"
 . "FACADE_LIB"
@@ -1069,7 +1091,12 @@ nolog()   { :; }
 # Extended ON so vmess/xhttp gates pass where used.
 is_sing_box_extended() { return 0; }
 
-# awk-extract the SHIPPED handler + the unavailable marker verbatim.
+# awk-extract the SHIPPED member-building helper + handler + the unavailable
+# marker verbatim. configure_outbound_handler delegates all selector/urltest
+# member construction to _build_proxy_member_outbounds, so the helper MUST be
+# extracted too — otherwise the member loop never runs ("not found"), no members
+# or per-link warnings are produced and the section is wrongly marked unavailable.
+eval "$(awk '/^_build_proxy_member_outbounds\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
 eval "$(awk '/^configure_outbound_handler\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
 eval "$(awk '/^mark_section_outbound_unavailable\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
 
@@ -1260,16 +1287,26 @@ echo 'DONE'
 USEOF
     sed -i "s|CONST_LIB|$lib/constants.sh|g; s|FACADE_LIB|$facade_lib|g; s|BIN_PATH|$bin|g" "$drv"
 
-    sh "$drv" 2>/dev/null | while IFS= read -r line; do
+    # Run the driver to a RESULT FILE, then consume tokens in the CURRENT shell
+    # (while read < file — NO pipe) so pass/fail/skip mutate the real counters
+    # and this test actually GATES the suite.
+    sh "$drv" > "$out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK)   pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE)   saw_done=1 ;;
             *) ;;
         esac
-    done
-    rm -f "$drv"
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "us-driver-completed:OK"
+    else
+        fail "us-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$drv" "$out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -1463,7 +1500,11 @@ TLEOF
             *) ;;
         esac
     done < "$out"
-    [ "$saw_done" = "1" ] && pass "tl-driver-completed:OK" || fail "tl-driver-completed:FAIL (driver aborted early)"
+    if [ "$saw_done" = "1" ]; then
+        pass "tl-driver-completed:OK"
+    else
+        fail "tl-driver-completed:FAIL (driver aborted early)"
+    fi
     rm -f "$drv" "$out"
 }
 
@@ -2095,16 +2136,26 @@ echo 'DONE'
 VMEOF
     sed -i "s|FACADE_LIB_PATH|$facade_lib|; s|NETSHIFT_LIB|$NETSHIFT_LIB_DIR|g" "$vm_tmp"
 
-    sh "$vm_tmp" 2>&1 | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local vm_out="/tmp/test-vmess-out-$$.log"
+    sh "$vm_tmp" > "$vm_out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
-    rm -f "$vm_tmp"
+    done < "$vm_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "vmess-driver-completed:OK"
+    else
+        fail "vmess-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$vm_tmp" "$vm_out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -2271,16 +2322,26 @@ echo 'DONE'
 CMEOF
     sed -i "s|CM_LIB_PATH|$cm_lib|" "$cm_tmp"
 
-    sh "$cm_tmp" 2>&1 | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local cm_out="/tmp/test-cm-out-$$.log"
+    sh "$cm_tmp" > "$cm_out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
-    rm -f "$cm_tmp"
+    done < "$cm_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "cm-driver-completed:OK"
+    else
+        fail "cm-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$cm_tmp" "$cm_out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -3535,17 +3596,27 @@ FBEOF
 
     sed -i "s|LIB_DIR|$lib|g" "$fb"
 
-    ash "$fb" 2>/dev/null | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local fb_out="/tmp/test-sub-fb-out-$$.log"
+    ash "$fb" > "$fb_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
+    done < "$fb_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "fb-driver-completed:OK"
+    else
+        fail "fb-driver-completed:FAIL (driver aborted early)"
+    fi
 
-    rm -f "$fb"
+    rm -f "$fb" "$fb_out"
 
     # ── Multi-URL subscription merge (task-022) ─────────────────────
     # Exercises the per-URL hashed cache keying + the config-gen merge-file
@@ -3827,17 +3898,27 @@ MUEOF
 
     sed -i "s|LIB_DIR|$lib|g; s|BIN_PATH|$bin|g" "$mu"
 
-    sh "$mu" 2>/dev/null | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local mu_out="/tmp/test-sub-mu-out-$$.log"
+    sh "$mu" > "$mu_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
+    done < "$mu_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "mu-driver-completed:OK"
+    else
+        fail "mu-driver-completed:FAIL (driver aborted early)"
+    fi
 
-    rm -f "$mu"
+    rm -f "$mu" "$mu_out"
 
     # ── Clear-subscription-cache worker (task-039) ───────────────────
     # Exercises subscription_clear_cache_and_redownload (bin/netshift) which
@@ -4674,15 +4755,27 @@ if updates_job_state_path "good-1.2_3" >/dev/null 2>&1; then
 else
     echo 'jobstate-valid-id-accepted:FAIL'
 fi
+echo 'DONE'
 VEOF
     sed -i "s|UPDATER_PATH|$updater|g;s|VDIR|$jdir|g" "$fb_jobstate"
-    ash "$fb_jobstate" 2>/dev/null | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail
+    # mutate the real counters and gate the suite.
+    local js_out="/tmp/netshift-jobstate-validate-out-$$.log"
+    ash "$fb_jobstate" > "$js_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
+            DONE) saw_done=1 ;;
         esac
-    done
-    rm -f "$fb_jobstate"
+    done < "$js_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "jobstate-validate-driver-completed:OK"
+    else
+        fail "jobstate-validate-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$fb_jobstate" "$js_out"
 
     # ── 4. stale job: running:true with a dead pid past grace → finished ─────
     local stale_dir="$jdir/stale"
@@ -4712,15 +4805,27 @@ if jq -e '.running == false and .success == false' "$state" >/dev/null 2>&1; the
 else
     echo 'jobstate-stale-marked-finished:FAIL'
 fi
+echo 'DONE'
 SEOF
     sed -i "s|UPDATER_PATH|$updater|g;s|SDIR|$stale_dir|g;s|SSTATE|$stale_state|g" "$stale_sh"
-    ash "$stale_sh" 2>/dev/null | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail
+    # mutate the real counters and gate the suite.
+    local stale_out="/tmp/netshift-jobstate-stale-out-$$.log"
+    ash "$stale_sh" > "$stale_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
+            DONE) saw_done=1 ;;
         esac
-    done
-    rm -f "$stale_sh"
+    done < "$stale_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "jobstate-stale-driver-completed:OK"
+    else
+        fail "jobstate-stale-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$stale_sh" "$stale_out"
 
     rm -rf "$jdir" "$stub"
 }
@@ -5062,14 +5167,15 @@ CURL5EOF
 # ─────────────────────────────────────────────────────────────────
 # Verifies the keyword-filter no longer poisons the per-section .rejected hash
 # and that a structurally valid body with >=1 proxy outbound is never vetoed by
-# a stale rejected-hash, while a genuinely outbound-less body still is. The two
+# a stale rejected-hash, while a genuinely outbound-less body still is. The
 # functions under test (mark_subscription_outbound_unavailable,
-# subscription_cache_is_usable) live in /usr/bin/netshift, not a sourceable lib,
-# so a tiny driver extracts JUST those two functions verbatim from the live bin
-# (awk between the `name() {` line and the matching column-0 `}`), stubs the few
-# helpers they call (log + the path builders), sources helpers.sh for the real
-# validate_subscription_file, and re-pins SUBSCRIPTION_CACHE_FOLDER to a temp
-# dir. Tokens use the same name:OK/FAIL convention as test_subscription.
+# subscription_cache_is_usable) and the per-URL cache path/hash builders live in
+# /usr/bin/netshift, not a sourceable lib, so a tiny driver extracts them
+# VERBATIM from the live bin (awk between the `name() {` line and the matching
+# column-0 `}`), stubs only the UCI-facing subscription-URL provider (plus the
+# logger), sources helpers.sh for the real validate_subscription_file, and
+# re-pins SUBSCRIPTION_CACHE_FOLDER to a temp dir. Tokens use the same
+# name:OK/FAIL convention as test_subscription.
 test_rejected_hash() {
     header "Subscription Rejected-Hash Validity (task-011)"
 
@@ -5096,23 +5202,37 @@ log() { :; }
 echolog() { :; }
 nolog() { :; }
 
-# Path builders are tiny; stub them exactly like the bin so the functions
-# resolve the temp cache dir.
-get_subscription_json_path() { echo "$SUBSCRIPTION_CACHE_FOLDER/${1}.json"; }
-get_subscription_rejected_cache_path() { echo "$SUBSCRIPTION_CACHE_FOLDER/${1}.rejected"; }
+# The real get_subscription_urls_for_section() enumerates a section's feed URLs
+# from UCI, which this driver has no access to, so stub ONLY that boundary. The
+# stub emits each URL newline-terminated: the consumers inside
+# mark_subscription_outbound_unavailable() read the provider output with a bare
+# `while IFS= read -r url` (no `|| [ -n "$url" ]` EOF guard), which drops an
+# unterminated final line - so the stub feeds the shape those consumers need.
+RH_TEST_URL="https://feed.example.com/sub"
+get_subscription_urls_for_section() { printf '%s\n' "$RH_TEST_URL"; }
 
 # Real validate_subscription_file from helpers.sh (no other deps needed).
 . "HELPERS_PATH"
 
-# Pull the two functions under test VERBATIM out of the live bin so the test
-# exercises the shipped code, not a copy. awk grabs from the function opener to
-# its matching column-0 closing brace.
-eval "$(awk '/^mark_subscription_outbound_unavailable\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
-eval "$(awk '/^subscription_cache_is_usable\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+# Pull the per-URL hash + path builders and the two functions under test
+# VERBATIM out of the live bin so the test exercises the shipped code, not a
+# copy. awk grabs each function from its opener to the matching column-0 brace.
+for fn in get_subscription_url_hash get_subscription_json_path \
+          get_subscription_rejected_cache_path \
+          mark_subscription_outbound_unavailable subscription_cache_is_usable; do
+    eval "$(awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+done
 
 # Globals the functions touch.
 SUBSCRIPTION_UNAVAILABLE_SECTIONS=""
 subscription_startup_blocked=0
+
+# The bin keys every feed by the md5 of its URL. Precompute that hash once and
+# build both the fixture and assertion paths with the shipped builders, so they
+# resolve exactly the per-URL cache files the functions under test touch.
+RH_URLHASH="$(get_subscription_url_hash "$RH_TEST_URL")"
+rh_json_path() { get_subscription_json_path "$1" "$RH_URLHASH"; }
+rh_rejected_path() { get_subscription_rejected_cache_path "$1" "$RH_URLHASH"; }
 
 valid_body='{
   "outbounds": [
@@ -5124,12 +5244,12 @@ valid_body='{
 # ── CASE 1: A — over-strict keyword filter (kept=0) must NOT write .rejected,
 #            and must remove a pre-existing one. ─────────────────────────────
 s1="sec1"
-printf '%s' "$valid_body" > "$(get_subscription_json_path "$s1")"
+printf '%s' "$valid_body" > "$(rh_json_path "$s1")"
 # Pre-poison with this body's hash; arg=1 (keyword filter) must clear it.
-md5sum "$(get_subscription_json_path "$s1")" | awk '{print $1}' \
-    > "$(get_subscription_rejected_cache_path "$s1")"
+md5sum "$(rh_json_path "$s1")" | awk '{print $1}' \
+    > "$(rh_rejected_path "$s1")"
 mark_subscription_outbound_unavailable "$s1" 1
-if [ ! -e "$(get_subscription_rejected_cache_path "$s1")" ]; then
+if [ ! -e "$(rh_rejected_path "$s1")" ]; then
     echo 'rh-case1-filter-no-rejected:OK'
 else
     echo 'rh-case1-filter-no-rejected:FAIL'
@@ -5143,12 +5263,12 @@ fi
 # ── CASE 2: A-recovery — pre-existing .rejected == a valid body hash, call with
 #            arg=1, assert .rejected gone (self-heal). ────────────────────────
 s2="sec2"
-printf '%s' "$valid_body" > "$(get_subscription_json_path "$s2")"
-md5sum "$(get_subscription_json_path "$s2")" | awk '{print $1}' \
-    > "$(get_subscription_rejected_cache_path "$s2")"
-[ -s "$(get_subscription_rejected_cache_path "$s2")" ] && pre2=1 || pre2=0
+printf '%s' "$valid_body" > "$(rh_json_path "$s2")"
+md5sum "$(rh_json_path "$s2")" | awk '{print $1}' \
+    > "$(rh_rejected_path "$s2")"
+[ -s "$(rh_rejected_path "$s2")" ] && pre2=1 || pre2=0
 mark_subscription_outbound_unavailable "$s2" 1
-if [ "$pre2" = "1" ] && [ ! -e "$(get_subscription_rejected_cache_path "$s2")" ]; then
+if [ "$pre2" = "1" ] && [ ! -e "$(rh_rejected_path "$s2")" ]; then
     echo 'rh-case2-recovery-rejected-removed:OK'
 else
     echo 'rh-case2-recovery-rejected-removed:FAIL'
@@ -5157,9 +5277,9 @@ fi
 # ── CASE 3: B — valid body with >=1 proxy outbound + .rejected == its hash ⇒
 #            subscription_cache_is_usable returns 0 (usable). ─────────────────
 s3="sec3"
-s3_json="$(get_subscription_json_path "$s3")"
+s3_json="$(rh_json_path "$s3")"
 printf '%s' "$valid_body" > "$s3_json"
-md5sum "$s3_json" | awk '{print $1}' > "$(get_subscription_rejected_cache_path "$s3")"
+md5sum "$s3_json" | awk '{print $1}' > "$(rh_rejected_path "$s3")"
 if subscription_cache_is_usable "$s3_json"; then
     echo 'rh-case3-valid-body-not-vetoed:OK'
 else
@@ -5171,7 +5291,7 @@ fi
 #            itself requires >=1 proxy outbound, so an outbound-less body is
 #            rejected at validation; this case proves the guard still holds. ──
 s4="sec4"
-s4_json="$(get_subscription_json_path "$s4")"
+s4_json="$(rh_json_path "$s4")"
 cat > "$s4_json" << 'NOPROXY'
 {
   "outbounds": [
@@ -5181,7 +5301,7 @@ cat > "$s4_json" << 'NOPROXY'
   ]
 }
 NOPROXY
-md5sum "$s4_json" | awk '{print $1}' > "$(get_subscription_rejected_cache_path "$s4")"
+md5sum "$s4_json" | awk '{print $1}' > "$(rh_rejected_path "$s4")"
 if subscription_cache_is_usable "$s4_json"; then
     echo 'rh-case4-no-proxy-body-vetoed:FAIL'
 else
@@ -5190,9 +5310,9 @@ fi
 
 # ── CASE 5: Regression — a normal valid body, no .rejected ⇒ usable (0). ──────
 s5="sec5"
-s5_json="$(get_subscription_json_path "$s5")"
+s5_json="$(rh_json_path "$s5")"
 printf '%s' "$valid_body" > "$s5_json"
-rm -f "$(get_subscription_rejected_cache_path "$s5")"
+rm -f "$(rh_rejected_path "$s5")"
 if subscription_cache_is_usable "$s5_json"; then
     echo 'rh-case5-normal-valid-usable:OK'
 else
@@ -5202,7 +5322,7 @@ fi
 # ── CASE 6: A — keyword_filter_active=0 (default) still records the rejected
 #            hash for a genuinely outbound-less body (flash-loop guard kept). ──
 s6="sec6"
-s6_json="$(get_subscription_json_path "$s6")"
+s6_json="$(rh_json_path "$s6")"
 cat > "$s6_json" << 'NOPROXY'
 {
   "outbounds": [
@@ -5211,11 +5331,11 @@ cat > "$s6_json" << 'NOPROXY'
   ]
 }
 NOPROXY
-rm -f "$(get_subscription_rejected_cache_path "$s6")"
+rm -f "$(rh_rejected_path "$s6")"
 mark_subscription_outbound_unavailable "$s6" 0
 expect6="$(md5sum "$s6_json" | awk '{print $1}')"
-got6="$(cat "$(get_subscription_rejected_cache_path "$s6")" 2>/dev/null)"
-if [ -s "$(get_subscription_rejected_cache_path "$s6")" ] && [ "$got6" = "$expect6" ]; then
+got6="$(cat "$(rh_rejected_path "$s6")" 2>/dev/null)"
+if [ -s "$(rh_rejected_path "$s6")" ] && [ "$got6" = "$expect6" ]; then
     echo 'rh-case6-genuine-unusable-recorded:OK'
 else
     echo 'rh-case6-genuine-unusable-recorded:FAIL'
@@ -5229,7 +5349,14 @@ RHEOF
     local rhcache="/tmp/netshift-rejected-cache-$$"
     rm -rf "$rhcache"
 
-    RH_CACHE_DIR="$rhcache" ash "$drv" 2>/dev/null | while IFS= read -r line; do
+    # Parse in the CURRENT shell (temp file + `while read < "$rh_out"`, NO pipe)
+    # so pass/fail update the global counters and an rh-case*:FAIL actually gates
+    # the suite (a pipe would run the while-body in a subshell - non-gating).
+    local rh_out="/tmp/netshift-rejected-out-$$.txt"
+    if ! RH_CACHE_DIR="$rhcache" ash "$drv" > "$rh_out" 2>/dev/null; then
+        fail "netshift-rejected driver exited non-zero"
+    fi
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
@@ -5237,10 +5364,10 @@ RHEOF
             DONE) ;;
             *) ;;
         esac
-    done
+    done < "$rh_out"
 
     rm -rf "$rhcache"
-    rm -f "$drv"
+    rm -f "$drv" "$rh_out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -5413,16 +5540,26 @@ echo 'DONE'
 DDEOF
     sed -i "s|FACADE_LIB_PATH|$facade_lib|; s|NETSHIFT_LIB|$NETSHIFT_LIB_DIR|g; s|BIN_PATH|$bin|g" "$drv"
 
-    ash "$drv" 2>/dev/null | while IFS= read -r line; do
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local dd_out="/tmp/netshift-dnsdetour-out-$$.log"
+    ash "$drv" > "$dd_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
             *:FAIL) fail "$line" ;;
             *:SKIP) skip "$line" ;;
-            DONE) ;;
+            DONE) saw_done=1 ;;
             *) ;;
         esac
-    done
-    rm -f "$drv"
+    done < "$dd_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "dnsdetour-driver-completed:OK"
+    else
+        fail "dnsdetour-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$drv" "$dd_out"
 }
 
 # ─────────────────────────────────────────────────────────────────

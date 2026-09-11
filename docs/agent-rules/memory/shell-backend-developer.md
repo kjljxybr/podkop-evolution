@@ -1754,3 +1754,28 @@ findings; keep under ~200 lines.
   `patch_source_ruleset_rules` exactly 3× (1000+1000+500); shellcheck -S error
   clean on all CI-path files; full smoke 224 passed / 0 failed (218 baseline + 6 chunkcheck assertions pinning the 1000 default).
 - COVERAGE: new smoke alias `chunkcheck` (test_ruleset_chunk_size) pins the 1000 default: 2500-element domain+subnet imports -> 3 calls 1000/1000/500; falsified by reverting the default to 5000 (4 FAILs, exit 1).
+
+## 2026-09-11: smoke-suite counter loss fixed suite-wide (`cmd | while` → file gating)
+
+- ALL piped `cmd | while` pass/fail consumers in tests/entrypoint.sh converted to
+  file gating (driver output → temp file, `while … done < "$f"` in the CURRENT
+  shell; no subshell ⇒ counters mutate): test_helpers, test_section_isolation,
+  test_sing_box_config, test_config_manager, test_subscription (fb+mu drivers),
+  test_jobstate (validate+stale drivers), test_dns_via_outbound,
+  test_unsupported_skip, test_rejected_hash. Only leftover `| while` is inside the
+  MUEOF driver — benign (no counters; merge goes through a file).
+- test_unsupported_skip: additionally awk-extracts `_build_proxy_member_outbounds`
+  (the shipped handler delegates member building to it) — the 6 us-* tokens were
+  falsely FAILing without it. test_rejected_hash: stubs ONLY the UCI-facing URL
+  provider (`get_subscription_urls_for_section`) + the loggers, and extracts the
+  REAL per-URL hash/path builders.
+- Crash gating (review F1) closed: all 9 converted sites gate a driver crash —
+  driver ends with `echo 'DONE'` (added to the si/jobstate drivers) and the consumer
+  emits a counted `<site>-driver-completed:OK/FAIL`; sabotaged `exit 3` proved a
+  counted FAIL + exit 1 (helpers 7/1, jobstate-stale 17/1). No CONVERTED site left
+  unguarded (pre-existing, out of scope: monfd + backupguard lack a DONE gate;
+  cc-worker + suburlopt lack an rc guard).
+- Counted == displayed: `all` 413 passed / 0 failed / 1 skipped (404 + 9 new DONE
+  gates; before: 224 counted vs 394✓+9✗+1⊘ displayed), exit 0; `unsupported` 24/0/1;
+  `rejected` 7/0. Supersedes the older note naming test_unsupported_skip as the
+  `cmd | while` example.
