@@ -315,7 +315,7 @@ save+`sing-box check` -> cron jobs -> start sing-box -> dnsmasq_configure ->
   gitignored (line 7 `docs/tasks`), so task specs are session artifacts (like
   .pr-review/), not committed — that's by project design (only TEMPLATE-*.md are
   force-tracked).
-- Operator design decisions for the nft model shift: B-02=A (router-originated
+- Operator design decisions for the nft model shift: B-02=A (SUPERSEDED 2026-09-11 — see the entry below) (router-originated
   traffic stays DIRECT in the new mark-everything-in-prerouting model; document
   only, don't restore mangle_output marking) and B-03/B-04=A (remove the dead
   @netshift_subnets populate path + dead SUBNETS_*_V6). Rule: dead-code removal
@@ -1465,3 +1465,31 @@ save+`sing-box check` -> cron jobs -> start sing-box -> dnsmasq_configure ->
 - 0c99ddd also ported: rulesets.sh chunked importers default 5000 -> 1000 (callers
   pass no size); nft.sh chunkers intentionally stay 5000, matching upstream.
 - GATES: busybox runtime checks passed; smoke 224/0 (218 baseline + 6 chunkcheck assertions); shellcheck clean.
+
+## router-originated OUTPUT marking fix — REVERSES B-02=A (2026-09-11)
+
+- DECISION REVERSED: B-02=A above ("router-originated stays DIRECT") no longer holds.
+  User-confirmed bug: dnsmasq hands the router ITSELF FakeIP answers for proxied
+  domains, so with no OUTPUT marking the router's own wget/opkg to a proxied
+  destination was never tproxied and black-holed. Operator's manual workaround was
+  `mangle_output ip daddr 198.18.0.0/15 meta mark set 0x00100000`.
+- FIX: `mangle_output` now applies the SAME destination-selective model as the
+  prerouting `mangle` chain — proxied-subnets union set + FakeIP v4/v6 + DoH CIDRs
+  when block_doh; mark-all tcp/udp when a global_proxy section is active; the
+  localv4/localv6/NFT_OUTBOUND_MARK returns stay FIRST.
+- ONE generator `nft_add_selective_marking_rules` (nft.sh) feeds BOTH chains
+  (prerouting adds `iifname "@<set>"`, output adds none), so they cannot drift —
+  that drift WAS the bug.
+- LOOP-SAFE: task-033 `route.default_mark=NFT_OUTBOUND_MARK` stamps sing-box egress,
+  and the output chain's FIRST `meta mark NFT_OUTBOUND_MARK return` keeps it out of
+  the new daddr marks. The old "direct by design" rationale is void — it dodged the
+  loop only by NOT marking OUTPUT, which is exactly what broke this.
+- VERIFY: pre-fix red-proof 10 counted FAILs; fixed smoke 423 passed / 0 failed /
+  1 skipped (424 after the added no-iifname assertion); live counter proof — a
+  locally generated packet to 198.18.x.x bumps the mark counter, one to a direct
+  address does not; `shellcheck -S error` clean.
+- RESIDUAL RISKS: sing-box DOWN -> router-originated marked flows fail closed (same
+  class as LAN) until recovery/monitor restart; `exclude_ntp` still inserts only
+  into `mangle` (router-originated NTP NOT excluded); a third party (mwan3-style)
+  writing extra skb mark bits breaks the exact-equality `meta mark 0x00200000`
+  egress return.

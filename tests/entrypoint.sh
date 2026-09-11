@@ -437,7 +437,7 @@ test_nft_ipv6() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Test: Destination-selective nft marking (task-034)
+# Test: Destination-selective nft marking (task-034 + router-originated OUTPUT marking fix)
 #
 # Regression: 0.8.6 marked ALL LAN tcp/udp into tproxy (mangle prerouting),
 # so EVERY forwarded flow (e.g. a torrent to a random direct IP) entered
@@ -448,16 +448,32 @@ test_nft_ipv6() {
 # that selective model, keeping mark-EVERYTHING only when a global_proxy
 # section is active.
 #
+# router-originated OUTPUT marking fix regression: the router-originated chain (mangle_output) had NO
+# marking rules at all, but dnsmasq hands the router ITSELF FakeIP answers for
+# proxied domains -> the router's own wget/opkg to a proxied destination was
+# never tproxied and black-holed. mangle_output must carry the SAME
+# destination-selective (or global_proxy mark-all) rules as mangle, AFTER the
+# localv4/v6 + NFT_OUTBOUND_MARK returns. The outbound return is what keeps
+# OUTPUT marking loop-safe: sing-box egress carries route.default_mark =
+# NFT_OUTBOUND_MARK (task-033) and must escape re-marking.
+#
 # This test awk-extracts the SHIPPED create_nft_rules (+ its task-034 helpers)
 # verbatim from the live bin, stubs the few UCI/predicate functions, and runs
-# the real ruleset against a real nft table, then inspects the mangle chain.
-# Five cases (per the spec):
-#   1. selective marking present + NO unconditional mark-all (default)
+# the real ruleset against a real nft table, then inspects BOTH the mangle
+# (prerouting, LAN) and mangle_output (router-originated) chains. The driver
+# dump is split into ---MANGLE--- / ---MANGLE_OUTPUT--- / ---SETS--- sections
+# and every assertion is scoped to its own section (sel_section), so a rule in
+# one chain can never satisfy — or hide — an assertion about the other.
+# Cases (per the spec):
+#   1. selective marking present + NO unconditional mark-all (default) — in
+#      BOTH chains (drift between them black-holes router-originated traffic)
 #   2. a direct (non-listed) destination is NOT marked -> bypasses sing-box
-#      (rule-structure check; + live counter when runnable)
-#   3. global_proxy override = mark-all IS present
+#      (rule-structure check)
+#   3. global_proxy override = mark-all IS present (in BOTH chains)
 #   4. IPv6 mirror selective when enable_ipv6=1 (+ no v6 mark-all)
 #   5. domain routing intact: FakeIP range still marked; sing-box check passes
+#   6. mangle_output ORDER: the localv4 + outbound-mark returns precede the marks
+#   7. DoH-block CIDRs marked in mangle_output too when block_doh=1
 # ─────────────────────────────────────────────────────────────────
 test_selective_marking() {
     header "Destination-selective nft marking (task-034)"
@@ -494,8 +510,9 @@ test_selective_marking() {
     #   SCN_BLOCKDOH     1 to enable DoH-block CIDR marking, else 0
     #   SCN_FULLROUTED   space-separated fully_routed_ips (proxy section), else ""
     # The driver writes the real shipped create_nft_rules + helpers, runs it,
-    # then dumps `nft list chain inet <table> mangle` to stdout for the parent
-    # to parse. Each emitted token is a name:OK / name:FAIL line.
+    # then dumps BOTH chains + the union set to stdout, each under a
+    # ---SECTION--- label (---MANGLE---, ---MANGLE_OUTPUT---, ---SETS---) for
+    # the parent to parse with sel_section.
     local drv="/tmp/netshift-selmark-$$.sh"
     cat > "$drv" << 'SELEOF'
 set -e
@@ -595,64 +612,141 @@ else
     create_nft_rules >/dev/null 2>&1
 fi
 
-nft list chain inet "$NFT_TABLE_NAME" mangle 2>/dev/null
+echo "---MANGLE---"
+nft list chain inet "$NFT_TABLE_NAME" mangle 2>/dev/null || true
+echo "---MANGLE_OUTPUT---"
+nft list chain inet "$NFT_TABLE_NAME" mangle_output 2>/dev/null || true
 echo "---SETS---"
 nft list set inet "$NFT_TABLE_NAME" "$NFT_COMMON_SET_NAME" 2>/dev/null || true
 SELEOF
     sed -i "s|LIB_DIR_PLACEHOLDER|$lib|g; s|BIN_PATH_PLACEHOLDER|$bin|g" "$drv"
 
+    # Extract ONE ---LABEL--- section of a driver dump (to the next label / EOF).
+    # Every assertion below is scoped through this: mangle and mangle_output are
+    # separate sections, and only scoping keeps each check meaningful (an
+    # unscoped grep would let an mangle_output rule satisfy a mangle assertion,
+    # silently hiding exactly the drift this test exists to catch).
+    sel_section() {
+        printf '%s\n' "$1" | awk -v want="---$2---" '
+            $0 == want { in_sec = 1; next }
+            /^---[A-Z_]+---$/ { in_sec = 0 }
+            in_sec { print }
+        '
+    }
+
     # ── Scenario 1+2+5: default selective (no global_proxy) ──────────
-    local out1
+    local out1 mangle1 mout1
     out1="$(SCN_TABLE="selmark_def_$$" SCN_IPV6=0 SCN_GLOBALPROXY="" SCN_BLOCKDOH=0 \
         SCN_FULLROUTED="" sh "$drv" 2>/dev/null)"
     nft delete table inet "selmark_def_$$" 2>/dev/null
+    mangle1="$(sel_section "$out1" MANGLE)"
+    mout1="$(sel_section "$out1" MANGLE_OUTPUT)"
 
-    # The selective marks must be present.
-    if echo "$out1" | grep -q "@$NFT_COMMON_SET_NAME"; then
-        pass "selective:default — proxied-subnets set rule present (@$NFT_COMMON_SET_NAME)"
+    # The selective marks must be present in the PREROUTING (LAN) chain.
+    if echo "$mangle1" | grep -q "@$NFT_COMMON_SET_NAME"; then
+        pass "selective:default — proxied-subnets set rule present in mangle (@$NFT_COMMON_SET_NAME)"
     else
-        fail "selective:default — @$NFT_COMMON_SET_NAME mark rule missing" "$(echo "$out1" | grep -i 'mark set' || echo "$out1")"
+        fail "selective:default — @$NFT_COMMON_SET_NAME mark rule missing in mangle" "$(echo "$mangle1" | grep -i 'mark set' || echo "$out1")"
     fi
-    if echo "$out1" | grep -Fq "$SB_FAKEIP_INET4_RANGE"; then
-        pass "selective:default — FakeIP range marked ($SB_FAKEIP_INET4_RANGE) [domain routing intact]"
+    if echo "$mangle1" | grep -Fq "$SB_FAKEIP_INET4_RANGE"; then
+        pass "selective:default — FakeIP range marked in mangle ($SB_FAKEIP_INET4_RANGE) [domain routing intact]"
     else
-        fail "selective:default — FakeIP range mark rule missing"
+        fail "selective:default — FakeIP range mark rule missing in mangle"
     fi
     # The proxied-subnets union set must exist (DoD: created).
-    if echo "$out1" | grep -q -- "---SETS---" && \
-       echo "$out1" | sed -n '/---SETS---/,$p' | grep -q "set $NFT_COMMON_SET_NAME"; then
+    local set1
+    set1="$(sel_section "$out1" SETS)"
+    if echo "$set1" | grep -q "set $NFT_COMMON_SET_NAME"; then
         pass "selective:default — union set $NFT_COMMON_SET_NAME created"
     else
         fail "selective:default — union set $NFT_COMMON_SET_NAME not created"
     fi
 
-    # Regression bypass: there must be NO unconditional mark-all tcp/udp rule
-    # (a mark-set rule that has NO daddr / saddr / set qualifier). We detect it
-    # structurally: a `meta l4proto (tcp|udp) meta mark set` line that does NOT
-    # also contain `daddr` or `saddr`.
-    local markall_lines
-    markall_lines="$(echo "$out1" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
-    if [ -z "$markall_lines" ]; then
+    # router-originated OUTPUT marking fix: the OUTPUT chain (router-originated traffic) must carry the SAME
+    # destination-selective marks, or dnsmasq's FakeIP answer for a proxied
+    # domain black-holes the router's own wget/opkg (no mark -> no tproxy).
+    if echo "$mout1" | grep -q "ip daddr @$NFT_COMMON_SET_NAME meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:output — proxied-subnets mark present in mangle_output (@$NFT_COMMON_SET_NAME)"
+    else
+        fail "selective:output — @$NFT_COMMON_SET_NAME mark missing in mangle_output (router-originated traffic black-holes)" "$(echo "$mout1" | grep -i 'mark set' || echo "$mout1")"
+    fi
+    if echo "$mout1" | grep -q "ip daddr $SB_FAKEIP_INET4_RANGE meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:output — FakeIP range marked in mangle_output ($SB_FAKEIP_INET4_RANGE) [router-originated domain routing]"
+    else
+        fail "selective:output — FakeIP range mark missing in mangle_output (router-originated traffic black-holes)"
+    fi
+
+    # Negative guard: the OUTPUT chain must NEVER carry the LAN-interface
+    # (iifname) qualifier — router-originated traffic does not arrive on a LAN
+    # interface, so a stray qualifier would silently exempt every rule in this
+    # chain (no mark -> no tproxy -> the original black-hole). The positive
+    # substrings above cannot catch it: nft can print the qualifier BEFORE the
+    # daddr match, so such a rule still contains the checked substring.
+    if echo "$mout1" | grep -q 'iifname'; then
+        fail "selective:output — iifname qualifier present in mangle_output (router-originated rules would never match)" "$(echo "$mout1" | grep 'iifname' || true)"
+    else
+        pass "selective:output — no iifname qualifier in mangle_output (router-originated rules can match)"
+    fi
+
+    # Regression bypass: there must be NO unconditional mark-all rule (a
+    # mark-set rule that has NO daddr / saddr / set qualifier) in EITHER chain.
+    # For mangle we detect it structurally: a `meta l4proto (tcp|udp) meta mark
+    # set` line that does NOT also contain `daddr` or `saddr`; for mangle_output
+    # any `meta mark set` line without daddr/saddr would be mark-all.
+    local markall_lines mout_markall_lines
+    markall_lines="$(echo "$mangle1" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
+    mout_markall_lines="$(echo "$mout1" | grep 'meta mark set' | grep -v 'daddr' | grep -v 'saddr' || true)"
+    if [ -z "$markall_lines" ] && [ -z "$mout_markall_lines" ]; then
         pass "selective:bypass — NO unconditional mark-all rule (direct IP NOT marked)"
     else
-        fail "selective:bypass — unconditional mark-all rule still present" "$markall_lines"
+        fail "selective:bypass — unconditional mark-all rule still present" "mangle: $markall_lines mangle_output: $mout_markall_lines"
+    fi
+
+    # router-originated OUTPUT marking fix: the returns MUST precede the marks in mangle_output. sing-box's
+    # OWN egress carries NFT_OUTBOUND_MARK (route.default_mark, task-033) and
+    # must escape re-marking (that is what makes OUTPUT marking loop-safe);
+    # local/loopback (router->router, DNS to 127.0.0.42) must stay direct.
+    local o_ret_local o_ret_out o_first_mark
+    o_ret_local="$(echo "$mout1" | grep -n "ip daddr @$NFT_LOCALV4_SET_NAME return" | head -1 | cut -d: -f1)"
+    o_ret_out="$(echo "$mout1" | grep -n "meta mark $NFT_OUTBOUND_MARK counter" | head -1 | cut -d: -f1)"
+    o_first_mark="$(echo "$mout1" | grep -n "meta mark set $NFT_FAKEIP_MARK" | head -1 | cut -d: -f1)"
+    if [ -n "$o_ret_local" ] && [ -n "$o_ret_out" ] && [ -n "$o_first_mark" ] && \
+       [ "$o_ret_local" -lt "$o_first_mark" ] && [ "$o_ret_out" -lt "$o_first_mark" ]; then
+        pass "selective:output-order — localv4 + outbound-mark returns precede the marks (loop-safe)"
+    else
+        fail "selective:output-order — returns missing or not before the marks (loop hazard)" "localv4=$o_ret_local outbound=$o_ret_out first_mark=$o_first_mark"
     fi
 
     # ── Scenario 3: global_proxy override -> mark-all present ────────
-    local out3
+    local out3 mangle3 mout3
     out3="$(SCN_TABLE="selmark_gp_$$" SCN_IPV6=0 SCN_GLOBALPROXY="gpsec" SCN_BLOCKDOH=0 \
         SCN_FULLROUTED="" sh "$drv" 2>/dev/null)"
     nft delete table inet "selmark_gp_$$" 2>/dev/null
+    mangle3="$(sel_section "$out3" MANGLE)"
+    mout3="$(sel_section "$out3" MANGLE_OUTPUT)"
 
     local gp_markall
-    gp_markall="$(echo "$out3" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
+    gp_markall="$(echo "$mangle3" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
     if [ -n "$gp_markall" ]; then
         pass "selective:globalproxy — mark-EVERYTHING rules present under global_proxy"
     else
         fail "selective:globalproxy — mark-all rules missing under global_proxy" "$out3"
     fi
-    # And under global_proxy the selective @set rule should NOT be added.
-    if echo "$out3" | grep -q "@$NFT_COMMON_SET_NAME"; then
+    # router-originated OUTPUT marking fix: router-originated traffic must be marked too under global_proxy
+    # (tcp AND udp), or the router's own flows still bypass the proxy.
+    if echo "$mout3" | grep -q "meta l4proto tcp meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:globalproxy-output — mark-EVERYTHING tcp rule present in mangle_output"
+    else
+        fail "selective:globalproxy-output — tcp mark-all rule missing in mangle_output" "$(echo "$mout3" | grep -i 'mark set' || echo "$mout3")"
+    fi
+    if echo "$mout3" | grep -q "meta l4proto udp meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:globalproxy-output — mark-EVERYTHING udp rule present in mangle_output"
+    else
+        fail "selective:globalproxy-output — udp mark-all rule missing in mangle_output"
+    fi
+    # And under global_proxy the selective @set rule should NOT be added to
+    # EITHER chain.
+    if printf '%s\n%s\n' "$mangle3" "$mout3" | grep -q "@$NFT_COMMON_SET_NAME"; then
         fail "selective:globalproxy — selective @set rule unexpectedly present under global_proxy"
     else
         pass "selective:globalproxy — selective @set rule correctly bypassed"
@@ -660,45 +754,59 @@ SELEOF
 
     # ── Scenario 4: IPv6 mirror selective (enable_ipv6=1) ────────────
     # Only meaningful if the kernel supports the v6 set + ip6 rules.
-    local out4
+    local out4 mangle4 mout4
     out4="$(SCN_TABLE="selmark_v6_$$" SCN_IPV6=1 SCN_GLOBALPROXY="" SCN_BLOCKDOH=0 \
         SCN_FULLROUTED="" sh "$drv" 2>/dev/null)"
     nft delete table inet "selmark_v6_$$" 2>/dev/null
+    mangle4="$(sel_section "$out4" MANGLE)"
+    mout4="$(sel_section "$out4" MANGLE_OUTPUT)"
 
-    if echo "$out4" | grep -q "ip6 daddr @$NFT_COMMON_SET_NAME_V6"; then
+    if echo "$mangle4" | grep -q "ip6 daddr @$NFT_COMMON_SET_NAME_V6"; then
         pass "selective:ipv6 — v6 union set mark rule present (@$NFT_COMMON_SET_NAME_V6)"
         local v6_markall
-        v6_markall="$(echo "$out4" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
+        v6_markall="$(echo "$mangle4" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
         if [ -z "$v6_markall" ]; then
             pass "selective:ipv6 — no mark-all rule with IPv6 enabled"
         else
             fail "selective:ipv6 — unexpected mark-all rule with IPv6 enabled" "$v6_markall"
         fi
-        if echo "$out4" | grep -Fq "$SB_FAKEIP_INET6_RANGE"; then
+        if echo "$mangle4" | grep -Fq "$SB_FAKEIP_INET6_RANGE"; then
             pass "selective:ipv6 — FakeIP v6 range marked ($SB_FAKEIP_INET6_RANGE)"
         else
             fail "selective:ipv6 — FakeIP v6 range mark rule missing"
+        fi
+        # router-originated OUTPUT marking fix: the same v6 marks must exist in the OUTPUT chain (the
+        # router's own v6 flows to proxied destinations were black-holed too).
+        if echo "$mout4" | grep -q "ip6 daddr @$NFT_COMMON_SET_NAME_V6 meta mark set $NFT_FAKEIP_MARK counter"; then
+            pass "selective:ipv6-output — v6 union set mark present in mangle_output (@$NFT_COMMON_SET_NAME_V6)"
+        else
+            fail "selective:ipv6-output — v6 union set mark missing in mangle_output" "$(echo "$mout4" | grep -i daddr || echo "$mout4")"
+        fi
+        if echo "$mout4" | grep -q "ip6 daddr $SB_FAKEIP_INET6_RANGE meta mark set $NFT_FAKEIP_MARK counter"; then
+            pass "selective:ipv6-output — FakeIP v6 range marked in mangle_output ($SB_FAKEIP_INET6_RANGE)"
+        else
+            fail "selective:ipv6-output — FakeIP v6 range mark missing in mangle_output"
         fi
     else
         # The driver enables v6 only if netshift_ipv6_enabled() returns true,
         # which it forced; absence here means the kernel rejected the v6 set/rule.
         skip "selective:ipv6 — v6 set/rule not applied (kernel ip6 support?)"
+        skip "selective:ipv6-output — mangle_output v6 marks not verified (kernel ip6 support?)"
     fi
 
-    # ── Live counter proof (best-effort, needs NET_ADMIN + a usable table) ──
-    # Apply the default-selective table once more and probe with `nft` matching:
-    # add a known proxied subnet to the union set, then verify a packet-shaped
-    # match logic — we cannot synthesize forwarded packets here, so we assert
-    # the deterministic rule ORDERING instead: the @localv4 return precedes the
-    # @set mark, and there is no catch-all mark after it.
-    local out_order
+    # ── fully_routed_ips: SOURCE-based marking (any destination) ────
+    # Clients listed in fully_routed_ips get their traffic proxied regardless
+    # of destination, so the source-mark rule must exist in the prerouting
+    # chain. (The rule-ordering / structure assertions live in Scenario 1+2+5.)
+    local out_order mangle_order
     out_order="$(SCN_TABLE="selmark_ord_$$" SCN_IPV6=0 SCN_GLOBALPROXY="" SCN_BLOCKDOH=0 \
         SCN_FULLROUTED="192.168.50.7" sh "$drv" 2>/dev/null)"
     nft delete table inet "selmark_ord_$$" 2>/dev/null
-    if echo "$out_order" | grep -q "ip saddr 192.168.50.7 meta mark set"; then
+    mangle_order="$(sel_section "$out_order" MANGLE)"
+    if echo "$mangle_order" | grep -q "ip saddr 192.168.50.7 meta mark set"; then
         pass "selective:fullrouted — fully_routed_ips source-mark rule present"
     else
-        fail "selective:fullrouted — fully_routed_ips source mark missing" "$(echo "$out_order" | grep -i saddr || echo "$out_order")"
+        fail "selective:fullrouted — fully_routed_ips source mark missing" "$(echo "$mangle_order" | grep -i saddr || echo "$out_order")"
     fi
 
     # ── Scenario 6 (THE REGRESSION REPRO): stale mark-all table + respawn ──
@@ -710,36 +818,80 @@ SELEOF
     # the new destination-selective rules dead -> "everything proxied / 100%
     # CPU" even though the selective code was present. The fix flushes the table
     # first, so the FINAL live chain must be purely selective with NO mark-all.
-    local out6
+    local out6 mangle6 mout6
     out6="$(SCN_TABLE="selmark_respawn_$$" SCN_IPV6=0 SCN_GLOBALPROXY="" SCN_BLOCKDOH=0 \
         SCN_FULLROUTED="" SCN_PRESEED=1 sh "$drv" 2>/dev/null)"
     nft delete table inet "selmark_respawn_$$" 2>/dev/null
+    mangle6="$(sel_section "$out6" MANGLE)"
+    mout6="$(sel_section "$out6" MANGLE_OUTPUT)"
 
     local respawn_markall
-    respawn_markall="$(echo "$out6" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
+    respawn_markall="$(echo "$mangle6" | grep 'meta mark set' | grep 'l4proto' | grep -v 'daddr' | grep -v 'saddr' || true)"
     if [ -z "$respawn_markall" ]; then
         pass "selective:respawn — NO stale mark-all rule survives a respawn (table flushed)"
     else
         fail "selective:respawn — stale mark-all rule SURVIVED the rebuild (regression)" "$respawn_markall"
     fi
-    if echo "$out6" | grep -q "@$NFT_COMMON_SET_NAME"; then
+    if echo "$mangle6" | grep -q "@$NFT_COMMON_SET_NAME"; then
         pass "selective:respawn — selective @set rule present after respawn"
     else
         fail "selective:respawn — selective @set rule missing after respawn" "$out6"
     fi
-    if echo "$out6" | sed -n '/---SETS---/,$p' | grep -q "set $NFT_COMMON_SET_NAME"; then
+    local set6
+    set6="$(sel_section "$out6" SETS)"
+    if echo "$set6" | grep -q "set $NFT_COMMON_SET_NAME"; then
         pass "selective:respawn — union set $NFT_COMMON_SET_NAME present after respawn"
     else
         fail "selective:respawn — union set $NFT_COMMON_SET_NAME missing after respawn"
     fi
     # The selective rules must not be DUPLICATED (proof the chain was rebuilt,
-    # not appended): exactly one @set mark rule.
-    local setrule_count
-    setrule_count="$(echo "$out6" | sed -n '/chain mangle/,/^\t}/p' | grep -c "daddr @$NFT_COMMON_SET_NAME" || true)"
-    if [ "$setrule_count" = "1" ]; then
-        pass "selective:respawn — exactly one @set mark rule (chain rebuilt, not appended)"
+    # not appended): exactly one @set mark rule in EACH chain. The trailing
+    # space anchors the match to the v4 set (a v6 mirror `_v6` suffix would
+    # otherwise also match).
+    local setrule_count mout_setrule_count
+    setrule_count="$(echo "$mangle6" | grep -c "daddr @$NFT_COMMON_SET_NAME " || true)"
+    mout_setrule_count="$(echo "$mout6" | grep -c "daddr @$NFT_COMMON_SET_NAME " || true)"
+    if [ "$setrule_count" = "1" ] && [ "$mout_setrule_count" = "1" ]; then
+        pass "selective:respawn — exactly one @set mark rule per chain (rebuilt, not appended)"
     else
-        fail "selective:respawn — expected 1 @set rule, found $setrule_count (append, not rebuild)" "$out6"
+        fail "selective:respawn — expected 1 @set rule per chain, found mangle=$setrule_count mangle_output=$mout_setrule_count (append, not rebuild)" "$out6"
+    fi
+
+    # ── Scenario 6b: DoH-block CIDRs marked in mangle_output too ─────
+    # block_doh is read ONCE and shared by both chains (router-originated OUTPUT marking fix), so a router
+    # whose own resolver probes a DoH IP is forced into sing-box exactly like
+    # LAN clients are — otherwise the route-level DoH reject never sees the
+    # router's own DoH traffic. Runs with IPv6 enabled to cover both loops.
+    local out_doh mangle_doh mout_doh doh_v4_first doh_v6_first
+    out_doh="$(SCN_TABLE="selmark_doh_$$" SCN_IPV6=1 SCN_GLOBALPROXY="" SCN_BLOCKDOH=1 \
+        SCN_FULLROUTED="" sh "$drv" 2>/dev/null)"
+    nft delete table inet "selmark_doh_$$" 2>/dev/null
+    mangle_doh="$(sel_section "$out_doh" MANGLE)"
+    mout_doh="$(sel_section "$out_doh" MANGLE_OUTPUT)"
+
+    # nft normalises /32 and /128 host CIDRs to the bare address in its output.
+    doh_v4_first="$(echo "$DOH_BLOCK_IPV4_CIDRS" | awk '{print $1}')"
+    doh_v4_first="${doh_v4_first%%/*}"
+    if echo "$mangle_doh" | grep -q "ip daddr $doh_v4_first meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:doh — DoH CIDR marked in mangle ($doh_v4_first)"
+    else
+        fail "selective:doh — DoH CIDR mark missing in mangle ($doh_v4_first)" "$(echo "$mangle_doh" | grep -i daddr || echo "$out_doh")"
+    fi
+    if echo "$mout_doh" | grep -q "ip daddr $doh_v4_first meta mark set $NFT_FAKEIP_MARK counter"; then
+        pass "selective:doh-output — DoH CIDR marked in mangle_output ($doh_v4_first)"
+    else
+        fail "selective:doh-output — DoH CIDR mark missing in mangle_output (router DoH probe escapes rejection)" "$(echo "$mout_doh" | grep -i daddr || echo "$mout_doh")"
+    fi
+    if echo "$mangle_doh" | grep -q "ip6 daddr @$NFT_COMMON_SET_NAME_V6"; then
+        doh_v6_first="$(echo "$DOH_BLOCK_IPV6_CIDRS" | awk '{print $1}')"
+        doh_v6_first="${doh_v6_first%%/*}"
+        if echo "$mout_doh" | grep -q "ip6 daddr $doh_v6_first meta mark set $NFT_FAKEIP_MARK counter"; then
+            pass "selective:doh-output — v6 DoH CIDR marked in mangle_output ($doh_v6_first)"
+        else
+            fail "selective:doh-output — v6 DoH CIDR mark missing in mangle_output ($doh_v6_first)"
+        fi
+    else
+        skip "selective:doh-output — v6 DoH mark not verified (kernel ip6 support?)"
     fi
 
     rm -f "$drv"

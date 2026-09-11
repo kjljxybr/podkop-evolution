@@ -413,7 +413,7 @@ findings; keep under ~200 lines.
   `tproxy ip to "$ADDR:$PORT"` is fine (IPv4 has no `:` ambiguity). sing-box
   inbounds (`sing_box_cm_add_*_inbound` address+port as SEPARATE jq args ->
   JSON `listen`/`listen_port`) have NO bracket defect — don't "fix" them.
-- **Router-originated traffic is DIRECT by design** (operator decision A). The
+- **Router-originated traffic is DIRECT by design** (SUPERSEDED 2026-09-11 — see the entry below) (operator decision A). The
   PR's model marks only LAN/forwarded traffic in `mangle` (prerouting) and
   splits proxy/direct in sing-box; `mangle_output` only carries local/loopback
   daddr returns + the `NFT_OUTBOUND_MARK` return (so sing-box-originated packets
@@ -1779,3 +1779,31 @@ findings; keep under ~200 lines.
   gates; before: 224 counted vs 394✓+9✗+1⊘ displayed), exit 0; `unsupported` 24/0/1;
   `rejected` 7/0. Supersedes the older note naming test_unsupported_skip as the
   `cmd | while` example.
+
+## router-originated OUTPUT marking fix (reverses the "direct by design" decision) — 2026-09-11
+
+- BUG (user-confirmed): dnsmasq hands the router ITSELF FakeIP answers for proxied
+  domains; with no OUTPUT marking the router's own wget/opkg to a proxied
+  destination was never tproxied and black-holed (manual workaround applied:
+  `mangle_output ip daddr 198.18.0.0/15 meta mark set 0x00100000`). This reverses
+  the task-014 "Router-originated traffic is DIRECT by design" decision above.
+- FIX: new generator `nft_add_selective_marking_rules` (nft.sh) emits the
+  destination-selective model for ONE chain; `create_nft_rules` calls it for BOTH
+  `mangle` (prerouting — passes `iifname "@$NFT_INTERFACE_SET_NAME"`) and
+  `mangle_output` (router-originated — NO qualifier), so the two cannot drift (the
+  drift WAS the bug). Model: `ip daddr @$NFT_COMMON_SET_NAME` + FakeIP v4 range +
+  v6 mirrors + DoH CIDRs when block_doh; mark-all tcp/udp when a global_proxy
+  section is active. localv4/localv6/NFT_OUTBOUND_MARK returns stay FIRST.
+- LOOP-SAFE: task-033's `route.default_mark = NFT_OUTBOUND_MARK` stamps sing-box
+  egress; mangle_output's FIRST `meta mark "$NFT_OUTBOUND_MARK" counter return`
+  matches it before the daddr marks can re-capture it. The old "direct by design"
+  rationale is void — it avoided the loop only by never marking OUTPUT at all.
+- VERIFY: pre-fix red-proof 10 counted FAILs; fixed smoke 423 passed / 0 failed /
+  1 skipped (424 after the added no-iifname assertion); live counter proof — a
+  locally generated packet to 198.18.x.x bumps the mark counter, one to a direct
+  address does not; shellcheck -S error clean.
+- RESIDUAL RISKS: sing-box DOWN -> router-originated marked flows fail closed (same
+  class as LAN) until recovery/monitor restart; `exclude_ntp` still inserts only
+  into `mangle` (router-originated NTP NOT excluded); a third party (mwan3-style)
+  writing extra skb mark bits breaks the exact-equality `meta mark 0x00200000`
+  egress return.
