@@ -1449,3 +1449,19 @@ save+`sing-box check` -> cron jobs -> start sing-box -> dnsmasq_configure ->
 - REUSABLE: when a "new input type" request lands, FIRST check if the backend
   already supports the underlying data (it often does) — the work may be purely
   a FE input-shape change + a thin backend branch reusing the existing build.
+
+## Upstream sync 2026-09-11 — task-013 follow-up closed (a4aa714) + chunk_size port (0c99ddd)
+
+- task-013's "TRUE fix" follow-up is CLOSED via the upstream port: check_sing_box
+  (usr/bin/netshift ~4673) no longer carries the major/minor/patch chain; it now
+  delegates to `is_min_package_version "$version" "1.12.4"` (the same `sort -V`
+  helper check_requirements uses), KEEPING the fork's extended strip
+  `version="${version%%-*}"` -> 1.13.12-extended-2.3.2 -> 1.13.12 -> ok;
+  1.12.0-extended-* -> fail. The section's LANDMINE warning about the ungrouped
+  `[ ] || [ ] && [ ]` chain no longer applies AT THAT SITE (general caution stays).
+- Upstream-parity accepted: garbage versions ("unknown"/"dev") now evaluate ok;
+  diagnostics-only, upstream same. SECOND-hardcode note stays TRUE: "1.12.4" still
+  hardcoded vs SB_REQUIRED_VERSION=1.12.0 — known desync, unchanged, out of scope.
+- 0c99ddd also ported: rulesets.sh chunked importers default 5000 -> 1000 (callers
+  pass no size); nft.sh chunkers intentionally stay 5000, matching upstream.
+- GATES: busybox runtime checks passed; smoke 224/0 (218 baseline + 6 chunkcheck assertions); shellcheck clean.

@@ -1468,6 +1468,147 @@ TLEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: Ruleset import chunk-size default (upstream port 0c99ddd)
+#
+# Pins the ported chunking default: import_plain_domain_list_to_local_source_
+# ruleset_chunked and import_plain_subnet_list_to_local_source_ruleset_chunked
+# must patch the ruleset in 1000-element chunks (upstream lowered this from
+# 5000; `chunk_size="${3:-1000}"`). The driver sources the REAL rulesets.sh from
+# the read-only mount, neutralizes log + the validators, and replaces the jq
+# patch step with a call logger. 2500 domains and 2500 IPv4 /32 entries must
+# each produce exactly 3 calls — 1000 + 1000 + 500 — with keys domain_suffix /
+# ip_cidr. Reverting the default to 5000 collapses each import into a single
+# 2500-element call and FAILs both the call-count and the size assertions.
+#
+# IMPORTANT (gating): the driver appends its call log to a FILE and the
+# assertions are consumed in the CURRENT shell via `while read < file` (NOT
+# `cmd | while`), so pass/fail mutate the real PASS/FAIL counters and this test
+# actually GATES the suite.
+# ─────────────────────────────────────────────────────────────────
+test_ruleset_chunk_size() {
+    header "Ruleset Chunk Size Default (upstream 0c99ddd)"
+
+    local lib="${NETSHIFT_LIB_DIR}/rulesets.sh"
+    if [ ! -r "$lib" ]; then
+        skip "rulesets.sh not found in ${NETSHIFT_LIB_DIR}"
+        return
+    fi
+
+    local work="/tmp/netshift-chunkcheck-$$"
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    # 2500 domains (site1..site2500.example.com) and 2500 IPv4 /32 entries:
+    # with the 1000 default each import splits 1000/1000/500.
+    local domlist="$work/domains.txt"
+    local netlist="$work/subnets.txt"
+    local domout="$work/dom.ruleset.json"
+    local netout="$work/net.ruleset.json"
+    local calllog="$work/calls.log"
+    : > "$calllog"
+    local i=1
+    while [ "$i" -le 2500 ]; do
+        printf 'site%d.example.com\n' "$i" >> "$domlist"
+        printf '10.0.%d.%d/32\n' "$((i / 256))" "$((i % 256))" >> "$netlist"
+        i=$((i + 1))
+    done
+
+    # Driver: source the REAL importers with neutralized dependencies; replace
+    # the jq patch with a logger writing "<key>:<element-count>" per call.
+    local drv="$work/driver.sh"
+    cat > "$drv" << 'CHUNKEOF'
+log() { :; }
+is_domain_suffix() { return 0; }
+is_ipv4() { return 0; }
+is_ipv4_cidr() { return 0; }
+
+. "RULESETS_LIB"
+
+# Minimal stand-in for helpers.sh's comma_string_to_json_array (helpers.sh is
+# not sourced here); only the comma count survives into the patch logger.
+comma_string_to_json_array() {
+    local input="$1"
+    if [ -z "$input" ]; then
+        printf '[]'
+        return
+    fi
+    printf '["%s"]\n' "$(printf '%s' "$input" | sed 's/,/","/g')"
+}
+
+# Replaces the real jq patch step: log the key ($2) and the element count of
+# the JSON array ($3, comma-separated -> awk field count).
+patch_source_ruleset_rules() {
+    local count
+    count=$(printf '%s' "$3" | awk -F, '{print NF}')
+    printf '%s:%s\n' "$2" "$count" >> "CHUNK_LOG"
+}
+
+import_plain_domain_list_to_local_source_ruleset_chunked "DOM_LIST" "DOM_OUT"
+import_plain_subnet_list_to_local_source_ruleset_chunked "NET_LIST" "NET_OUT"
+printf 'DONE\n' >> "CHUNK_LOG"
+CHUNKEOF
+    sed -i "s|RULESETS_LIB|$lib|g; s|CHUNK_LOG|$calllog|g; s|DOM_LIST|$domlist|g; s|NET_LIST|$netlist|g; s|DOM_OUT|$domout|g; s|NET_OUT|$netout|g" "$drv"
+
+    sh "$drv" > /dev/null 2>&1 || true
+
+    # Consume the call log in the CURRENT shell (no pipe) so the counters gate.
+    local line
+    local dom_calls=0 dom_sizes="" net_calls=0 net_sizes="" other_lines=0 saw_done=0
+    while IFS= read -r line; do
+        case "$line" in
+            DONE) saw_done=1 ;;
+            domain_suffix:*)
+                dom_calls=$((dom_calls + 1))
+                dom_sizes="$dom_sizes ${line#domain_suffix:}"
+                ;;
+            ip_cidr:*)
+                net_calls=$((net_calls + 1))
+                net_sizes="$net_sizes ${line#ip_cidr:}"
+                ;;
+            *) other_lines=$((other_lines + 1)) ;;
+        esac
+    done < "$calllog"
+
+    if [ "$dom_calls" = "3" ]; then
+        pass "chunk-domain-calls-3:OK"
+    else
+        fail "chunk-domain-calls-3:FAIL" "domain_suffix patches=$dom_calls (want 3)"
+    fi
+
+    if [ "$dom_sizes" = " 1000 1000 500" ]; then
+        pass "chunk-domain-sizes-1000-1000-500:OK"
+    else
+        fail "chunk-domain-sizes-1000-1000-500:FAIL" "sizes=[$dom_sizes]"
+    fi
+
+    if [ "$net_calls" = "3" ]; then
+        pass "chunk-subnet-calls-3:OK"
+    else
+        fail "chunk-subnet-calls-3:FAIL" "ip_cidr patches=$net_calls (want 3)"
+    fi
+
+    if [ "$net_sizes" = " 1000 1000 500" ]; then
+        pass "chunk-subnet-sizes-1000-1000-500:OK"
+    else
+        fail "chunk-subnet-sizes-1000-1000-500:FAIL" "sizes=[$net_sizes]"
+    fi
+
+    if [ "$other_lines" = "0" ]; then
+        pass "chunk-only-domain-suffix-ip-cidr-keys:OK"
+    else
+        fail "chunk-only-domain-suffix-ip-cidr-keys:FAIL" "unexpected log lines=$other_lines"
+    fi
+
+    if [ "$saw_done" = "1" ]; then
+        pass "chunk-driver-completed:OK"
+    else
+        fail "chunk-driver-completed:FAIL (driver aborted early)"
+    fi
+
+    rm -rf "$work"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: Monitor procd-lock fd hygiene (task-035) + monitor-leak (task-036)
 #
 # ROOT CAUSE under test: the long-lived health monitor used to be launched with
@@ -6722,6 +6863,7 @@ main() {
             test_monitor_fd_hygiene
             test_unsupported_skip
             test_text_list_outbound
+            test_ruleset_chunk_size
             test_diagnostics
             test_subscription
             test_fastest_group
@@ -6751,6 +6893,7 @@ main() {
         monfd)       test_monitor_fd_hygiene ;;
         unsupported) test_unsupported_skip ;;
         textlist)    test_text_list_outbound ;;
+        chunkcheck)  test_ruleset_chunk_size ;;
         diagnostics) test_diagnostics ;;
         subscription) test_subscription ;;
         fastest)     test_fastest_group ;;
@@ -6773,7 +6916,7 @@ main() {
         sb)          test_sing_box_config ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard"
             exit 1
             ;;
     esac

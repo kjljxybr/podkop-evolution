@@ -61,7 +61,7 @@ patch_source_ruleset_rules() {
 import_plain_domain_list_to_local_source_ruleset_chunked() {
     local plain_list_filepath="$1"
     local ruleset_filepath="$2"
-    local chunk_size="${3:-5000}"
+    local chunk_size="${3:-1000}"
 
     local array count json_array
     count=0
@@ -103,7 +103,7 @@ import_plain_domain_list_to_local_source_ruleset_chunked() {
 import_plain_subnet_list_to_local_source_ruleset_chunked() {
     local plain_list_filepath="$1"
     local ruleset_filepath="$2"
-    local chunk_size="${3:-5000}"
+    local chunk_size="${3:-1000}"
 
     local array count json_array
     count=0

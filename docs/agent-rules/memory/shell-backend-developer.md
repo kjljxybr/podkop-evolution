@@ -1729,3 +1729,28 @@ findings; keep under ~200 lines.
   /tuic:// placeholders only — no real link/sub data. NO sacred
   constant/port/mark/path change; UCI schema ADDITIVE + back-compat; FRONTEND
   untouched (parallel agent owns section.js/TS/i18n/main.js).
+
+## Upstream sync 2026-09-11: check_sing_box delegated to helper + chunked importers default 1000
+
+- Ported upstream a4aa714 into `check_sing_box` (`usr/bin/netshift` ~:4673):
+  hand-rolled major/minor/patch chain DELETED; compare now
+  `is_min_package_version "$version" "1.12.4"` after `version="${version#v}"`.
+  Fork's extended-core strip `version="${version%%-*}"` intentionally KEPT
+  (`1.13.12-extended-2.3.2` → `1.13.12`); helper (`usr/lib/helpers.sh`) uses
+  `sort -V`.
+- Consequence for task-013 above: its out-of-scope-bug landmine note about the
+  ungrouped `[ ] || [ ] && [ ]` chain NO LONGER APPLIES at this site — that
+  chain is deleted and the helper uses `sort -V`. The general caution about
+  ungrouped `&&`/`||` chains elsewhere remains valid.
+- Accepted upstream-parity: unparseable versions ("unknown", "dev",
+  "1.12.4extra") now yield version_ok=1 (`sort -V` sorts above the numeric
+  prefix; was 0). Diagnostics-only path; upstream identical by design.
+- Ported upstream 0c99ddd: rulesets.sh chunked importers (domain + subnet
+  `*_to_local_source_ruleset_chunked`) default chunk_size 5000→1000; only
+  callers bin/netshift:3404/3425/3734/3852 (no explicit size). nft.sh chunkers
+  deliberately stay 5000 (upstream touched only rulesets.sh).
+- Verified on the real runtime (OpenWrt 24.10.6 / BusyBox 1.36.1): `sort -V`
+  ordering correct; 2500 domains + 2500 IPv4 /32 CIDRs fire
+  `patch_source_ruleset_rules` exactly 3× (1000+1000+500); shellcheck -S error
+  clean on all CI-path files; full smoke 224 passed / 0 failed (218 baseline + 6 chunkcheck assertions pinning the 1000 default).
+- COVERAGE: new smoke alias `chunkcheck` (test_ruleset_chunk_size) pins the 1000 default: 2500-element domain+subnet imports -> 3 calls 1000/1000/500; falsified by reverting the default to 5000 (4 FAILs, exit 1).
