@@ -20,6 +20,15 @@ TMP_SUBSCRIPTION_DOWNLOAD_FOLDER="$TMP_SING_BOX_FOLDER/subscription-downloads"
 # tag-dedup + sing-box check bisection). Per-feed cache files are keyed
 # "${section}.<md5(url)>.<ext>" under SUBSCRIPTION_CACHE_FOLDER.
 TMP_SUBSCRIPTION_MERGE_FOLDER="$TMP_SING_BOX_FOLDER/subscription-merge"
+# Marks a subscription body that was downloaded into the cache but never made it
+# into the running sing-box. The cache compares a feed against what is already
+# stored, so without this marker the same body counts as "unchanged" on the next
+# run and the router keeps serving the old outbounds. Lives in tmpfs on purpose:
+# a reboot, and any full start, applies the cache anyway.
+SUBSCRIPTION_PENDING_APPLY_FLAG="$TMP_SING_BOX_FOLDER/subscription-pending-apply"
+# Seconds to wait after SIGHUP before deciding that sing-box came back up on the
+# new config. Tests set it to 0.
+SING_BOX_RELOAD_SETTLE_DELAY="3"
 # Subscription User-Agent fallback. Many panels return a DIFFERENT body format
 # depending on the client User-Agent (sing-box JSON vs base64 URI list vs Clash
 # vs Xray JSON, or an HTML/403 stub for unknown clients). When no User-Agent is

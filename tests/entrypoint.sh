@@ -7170,6 +7170,7 @@ mkdir -p "$HR_DIR"
 # rebuild without a restart finds the rule-set files of the running sing-box.
 # The rule set must still be referenced by the new config, and a tag prepared
 # twice in one build (several plain remote lists) must be added only once.
+eval "$(extract rule_references_ruleset)"
 eval "$(extract prepare_source_ruleset)"
 
 TMP_RULESET_FOLDER="$HR_DIR/rulesets"
@@ -7192,6 +7193,10 @@ route_refs() {
     printf '%s' "$config" | jq --arg t "$1" '[.route.rules[] | select(.__service_tag == "main-route-rule")
         | (.rule_set // []) | if type == "array" then .[] else . end | select(. == $t)] | length'
 }
+route_refs_in() {
+    printf '%s' "$config" | jq --arg r "$1" --arg t "$2" '[.route.rules[] | select(.__service_tag == $r)
+        | (.rule_set // []) | if type == "array" then .[] else . end | select(. == $t)] | length'
+}
 dns_refs() {
     printf '%s' "$config" | jq --arg t "$1" '[.dns.rules[] | select(.__service_tag == "fakeip-dns-rule-tag")
         | (.rule_set // []) | if type == "array" then .[] else . end | select(. == $t)] | length'
@@ -7211,8 +7216,11 @@ else
     echo "hr-prepare-fresh-file-referenced(defs=$(rule_set_defs main-user-domains-ruleset) route=$(route_refs main-user-domains-ruleset) dns=$(dns_refs main-user-domains-ruleset)):FAIL"
 fi
 
-# CASE P2: rebuild while the rule-set file already exists -> still referenced,
-#          and the file content used by the running sing-box is kept.
+# CASE P2: rebuild while the rule-set file already exists -> still referenced.
+#          A `user` rule set is refilled from UCI right after this call and the
+#          patches only ever add, so the stale file must NOT be reused: a domain
+#          the user just removed would otherwise survive in the running config
+#          until the next full restart.
 printf '%s' '{"version":3,"rules":[{"domain_suffix":["example.com"]}]}' > "$ud_path"
 base_config
 prepare_source_ruleset "main" "user" "domains" "main-route-rule"
@@ -7223,10 +7231,23 @@ if [ "$(rule_set_defs main-user-domains-ruleset)" = "1" ] && \
 else
     echo "hr-prepare-existing-file-referenced(defs=$(rule_set_defs main-user-domains-ruleset) route=$(route_refs main-user-domains-ruleset) dns=$(dns_refs main-user-domains-ruleset)):FAIL"
 fi
-if [ "$(jq -c . "$ud_path" 2>/dev/null)" = '{"version":3,"rules":[{"domain_suffix":["example.com"]}]}' ]; then
-    echo 'hr-prepare-existing-file-content-kept:OK'
+if [ "$(jq -c . "$ud_path" 2>/dev/null)" = '{"version":3,"rules":[]}' ]; then
+    echo 'hr-prepare-user-file-rebuilt:OK'
 else
-    echo "hr-prepare-existing-file-content-kept(got '$(cat "$ud_path" 2>/dev/null)'):FAIL"
+    echo "hr-prepare-user-file-rebuilt(got '$(cat "$ud_path" 2>/dev/null)'):FAIL"
+fi
+
+# CASE P2b: the same for a `local` rule set, whose content comes from the local
+#           list files and is re-imported right after this call.
+ld_path="$TMP_RULESET_FOLDER/main-local-domains-ruleset.json"
+printf '%s' '{"version":3,"rules":[{"domain_suffix":["stale.example"]}]}' > "$ld_path"
+base_config
+prepare_source_ruleset "main" "local" "domains" "main-route-rule"
+if [ "$(jq -c . "$ld_path" 2>/dev/null)" = '{"version":3,"rules":[]}' ] && \
+    [ "$(route_refs main-local-domains-ruleset)" = "1" ]; then
+    echo 'hr-prepare-local-file-rebuilt:OK'
+else
+    echo "hr-prepare-local-file-rebuilt(got '$(cat "$ld_path" 2>/dev/null)' route=$(route_refs main-local-domains-ruleset)):FAIL"
 fi
 
 # CASE P3: the same tag prepared twice in one fresh build -> one definition.
@@ -7254,12 +7275,51 @@ if [ "$(rule_set_defs main-remote-domains-ruleset)" = "1" ] && \
 else
     echo "hr-prepare-same-tag-existing-once(defs=$(rule_set_defs main-remote-domains-ruleset) route=$(route_refs main-remote-domains-ruleset)):FAIL"
 fi
+# ...and a plain remote list IS reused: its content comes from downloads that a
+# config rebuild does not repeat, so dropping the file would empty the rule set.
+if [ "$(jq -c . "$rd_path" 2>/dev/null)" = '{"version":3,"rules":[{"domain_suffix":["example.org"]}]}' ]; then
+    echo 'hr-prepare-remote-file-kept:OK'
+else
+    echo "hr-prepare-remote-file-kept(got '$(cat "$rd_path" 2>/dev/null)'):FAIL"
+fi
+
+# CASE P5: a rule-set file that is not valid JSON (an interrupted write) is
+#          recreated instead of failing every later build until a restart.
+printf '%s' 'not json at all' > "$rd_path"
+base_config
+prepare_source_ruleset "main" "remote" "domains" "main-route-rule"
+if [ "$(jq -c . "$rd_path" 2>/dev/null)" = '{"version":3,"rules":[]}' ] && \
+    [ "$(route_refs main-remote-domains-ruleset)" = "1" ]; then
+    echo 'hr-prepare-corrupt-file-recreated:OK'
+else
+    echo "hr-prepare-corrupt-file-recreated(got '$(cat "$rd_path" 2>/dev/null)' route=$(route_refs main-remote-domains-ruleset)):FAIL"
+fi
+
+# CASE P6: the tag is already defined, but ANOTHER route rule needs the
+#          reference. Deciding by "is this tag anywhere in the config" would
+#          leave that rule without a rule_set — everything it matches would go
+#          direct.
+rm -f "$rd_path"
+base_config
+config=$(sing_box_cm_add_route_rule "$config" "second-route-rule" "tproxy-in" "main-out")
+prepare_source_ruleset "main" "remote" "domains" "main-route-rule"
+prepare_source_ruleset "main" "remote" "domains" "second-route-rule"
+if [ "$(rule_set_defs main-remote-domains-ruleset)" = "1" ] && \
+    [ "$(route_refs_in main-route-rule main-remote-domains-ruleset)" = "1" ] && \
+    [ "$(route_refs_in second-route-rule main-remote-domains-ruleset)" = "1" ]; then
+    echo 'hr-prepare-second-rule-gets-reference:OK'
+else
+    echo "hr-prepare-second-rule-gets-reference(defs=$(rule_set_defs main-remote-domains-ruleset) first=$(route_refs_in main-route-rule main-remote-domains-ruleset) second=$(route_refs_in second-route-rule main-remote-domains-ruleset)):FAIL"
+fi
 
 # ── reload_sing_box_config_in_place ───────────────────────────────────
 # Stubs replace only the process boundary (pidof/kill), the full restart and
 # the heavy config generator. The generator stub behaves like the real one:
 # it writes the config, or exits the shell when sing-box rejects it.
+eval "$(extract get_sing_box_daemon_pid)"
 eval "$(extract reload_sing_box_config_in_place)"
+
+SING_BOX_RELOAD_SETTLE_DELAY=0
 
 hr_cfg="$HR_DIR/config.json"
 config_get() {
@@ -7268,12 +7328,31 @@ config_get() {
     *) eval "$1=\"\${4:-}\"" ;;
     esac
 }
-pidof() {
-    [ "$1" = "sing-box" ] && [ -n "$HR_PID" ] || return 1
-    printf '%s\n' "$HR_PID"
+uci_get() {
+    # The reload path reads exactly one option: the sing-box service conffile.
+    printf '%s' "$HR_CONFFILE"
 }
+# Fake process table. pidof lists every sing-box process in no particular order
+# and each pid's argv comes from HR_CMDLINE_<pid>: 4241 is one of the transient
+# helpers NetShift spawns (`check`), 4242 is the daemon started with `run`.
+pidof() {
+    [ "$1" = "sing-box" ] && [ -n "$HR_PIDS" ] || return 1
+    printf '%s\n' "$HR_PIDS"
+}
+read_proc_cmdline() {
+    eval "printf '%s\n' \"\${HR_CMDLINE_$1:-}\""
+}
+HR_CMDLINE_4241='/usr/bin/sing-box
+-c
+/tmp/sing-box/config.json
+check'
+HR_CMDLINE_4242='/usr/bin/sing-box
+-D
+/var/run/sing-box
+run'
 kill() {
     printf '%s\n' "$*" >> "$HR_DIR/kill.log"
+    [ "$HR_KILL_DIES" = "1" ] && HR_PIDS="4241"
     return "$HR_KILL_RC"
 }
 restart() {
@@ -7288,8 +7367,10 @@ sing_box_init_config() {
 hr_reset() {
     rm -f "$HR_DIR/kill.log" "$HR_DIR/restart.log" "$HR_DIR/build.log"
     printf '%s' '{"generation":1}' > "$hr_cfg"
-    HR_PID="4242"
+    HR_PIDS="4241 4242"
+    HR_CONFFILE="$hr_cfg"
     HR_KILL_RC=0
+    HR_KILL_DIES=0
     HR_BUILD_OK=1
     HR_NEW_CONFIG='{"generation":2}'
 }
@@ -7302,7 +7383,7 @@ hr_kills() {
 
 # CASE R1: sing-box is not running -> stock full restart, no build, no signal.
 hr_reset
-HR_PID=""
+HR_PIDS=""
 reload_sing_box_config_in_place
 rc=$?
 if [ "$rc" -eq 0 ] && [ "$(hr_count restart)" = "1" ] && [ "$(hr_count build)" = "0" ] && [ -z "$(hr_kills)" ]; then
@@ -7356,10 +7437,51 @@ else
     echo "hr-reload-signal-failure-restarts(rc=$rc restart=$(hr_count restart) kill='$(hr_kills)'):FAIL"
 fi
 
+# CASE R6: only a transient sing-box process is around (a `check` that is about
+#          to exit). Signalling it would be silently lost, so there is no daemon
+#          to reload and the restart is the honest answer.
+hr_reset
+HR_PIDS="4241"
+reload_sing_box_config_in_place
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_count restart)" = "1" ] && [ "$(hr_count build)" = "0" ] && [ -z "$(hr_kills)" ]; then
+    echo 'hr-reload-transient-process-only-restarts:OK'
+else
+    echo "hr-reload-transient-process-only-restarts(rc=$rc restart=$(hr_count restart) build=$(hr_count build) kill='$(hr_kills)'):FAIL"
+fi
+
+# CASE R7: the running daemon uses a different config file than the one the
+#          rebuild writes -> SIGHUP would re-read the old file and report an
+#          update that never happened. Restart instead, before building.
+hr_reset
+HR_CONFFILE="/etc/sing-box/config.json"
+reload_sing_box_config_in_place
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_count restart)" = "1" ] && [ "$(hr_count build)" = "0" ] && [ -z "$(hr_kills)" ]; then
+    echo 'hr-reload-conffile-mismatch-restarts:OK'
+else
+    echo "hr-reload-conffile-mismatch-restarts(rc=$rc restart=$(hr_count restart) build=$(hr_count build) kill='$(hr_kills)'):FAIL"
+fi
+
+# CASE R8: the signal is delivered but the daemon does not survive the reload.
+#          A delivered signal is not an applied config, so this is a restart,
+#          not a success.
+hr_reset
+HR_KILL_DIES=1
+reload_sing_box_config_in_place
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_kills)" = "-HUP 4242" ] && [ "$(hr_count restart)" = "1" ]; then
+    echo 'hr-reload-daemon-gone-after-signal-restarts:OK'
+else
+    echo "hr-reload-daemon-gone-after-signal-restarts(rc=$rc kill='$(hr_kills)' restart=$(hr_count restart)):FAIL"
+fi
+
 # ── subscription_update applies a changed feed without a restart ──────
 eval "$(extract subscription_update)"
 
 TMP_SUBSCRIPTION_FOLDER="$HR_DIR/sub-tmp"
+TMP_SING_BOX_FOLDER="$HR_DIR/sing-box"
+SUBSCRIPTION_PENDING_APPLY_FLAG="$TMP_SING_BOX_FOLDER/subscription-pending-apply"
 SUBSCRIPTION_CACHE_FOLDER="$HR_DIR/sub-cache"
 mkdir -p "$SUBSCRIPTION_CACHE_FOLDER"
 config_foreach() { "$1" "main"; }
@@ -7389,20 +7511,22 @@ reload_sing_box_config_in_place() {
     return "$HR_RELOAD_RC"
 }
 
-# CASE U1: a changed feed is applied by reloading sing-box, not by a restart.
-rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log"
+# CASE U1: a changed feed is applied by reloading sing-box, not by a restart,
+#          and a successful apply leaves no pending marker behind.
+rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log" "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 HR_DOWNLOAD_RC=0
 HR_RELOAD_RC=0
 subscription_update > /dev/null 2>&1
 rc=$?
-if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "1" ] && [ "$(hr_count restart)" = "0" ]; then
+if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "1" ] && [ "$(hr_count restart)" = "0" ] && \
+    [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ]; then
     echo 'hr-update-changed-feed-reloads-without-restart:OK'
 else
     echo "hr-update-changed-feed-reloads-without-restart(rc=$rc reload=$(hr_count reload) restart=$(hr_count restart)):FAIL"
 fi
 
 # CASE U2: an unchanged feed touches neither sing-box nor NetShift.
-rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log"
+rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log" "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 HR_DOWNLOAD_RC=2
 subscription_update > /dev/null 2>&1
 rc=$?
@@ -7412,8 +7536,8 @@ else
     echo "hr-update-unchanged-feed-no-reload(rc=$rc reload=$(hr_count reload) restart=$(hr_count restart)):FAIL"
 fi
 
-# CASE U3: a failed reload is reported to the caller.
-rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log"
+# CASE U3: a failed reload is reported to the caller and remembered.
+rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log" "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 HR_DOWNLOAD_RC=0
 HR_RELOAD_RC=1
 subscription_update > /dev/null 2>&1
@@ -7422,6 +7546,71 @@ if [ "$rc" -ne 0 ] && [ "$(hr_count reload)" = "1" ]; then
     echo 'hr-update-reload-failure-propagates:OK'
 else
     echo "hr-update-reload-failure-propagates(rc=$rc reload=$(hr_count reload)):FAIL"
+fi
+if [ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ]; then
+    echo 'hr-update-failed-apply-marked:OK'
+else
+    echo 'hr-update-failed-apply-marked(no marker):FAIL'
+fi
+
+# CASE U4: the next run finds the feed "unchanged" — the body was already
+#          written into the cache before the failed apply — but the change still
+#          has not reached sing-box. It must be applied now instead of logging
+#          "no changes detected" and leaving the router on the old outbounds.
+rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log"
+HR_DOWNLOAD_RC=2
+HR_RELOAD_RC=0
+subscription_update > /dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "1" ] && [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ]; then
+    echo 'hr-update-pending-apply-retried:OK'
+else
+    echo "hr-update-pending-apply-retried(rc=$rc reload=$(hr_count reload) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
+fi
+
+# ── the rebuild subshell against the REAL save path ───────────────────
+# R2 proves the caller survives a rejected config, but only against a stub that
+# exits before touching anything. The real guarantee is sing_box_save_config:
+# it validates a temporary file and moves it into place only afterwards, while
+# sing_box_config_check exits the shell on rejection.
+eval "$(extract sing_box_save_config)"
+eval "$(extract sing_box_config_check)"
+
+mkdir -p "$HR_DIR/bin"
+export HR_SB_CHECK_OK="$HR_DIR/sb_check_ok"
+cat > "$HR_DIR/bin/sing-box" << 'SBEOF'
+#!/bin/sh
+[ -f "$HR_SB_CHECK_OK" ] && exit 0
+exit 1
+SBEOF
+chmod 0755 "$HR_DIR/bin/sing-box"
+PATH="$HR_DIR/bin:$PATH"
+
+sb_real_cfg="$HR_DIR/real-config.json"
+config_get() {
+    case "$2:$3" in
+    settings:config_path) eval "$1=\"\$sb_real_cfg\"" ;;
+    *) eval "$1=\"\${4:-}\"" ;;
+    esac
+}
+printf '%s' '{"generation":"running"}' > "$sb_real_cfg"
+config='{"generation":"new"}'
+
+rm -f "$HR_SB_CHECK_OK"
+survived=0
+( sing_box_save_config ) > /dev/null 2>&1 || survived=1
+if [ "$survived" = "1" ] && [ "$(jq -c . "$sb_real_cfg" 2>/dev/null)" = '{"generation":"running"}' ]; then
+    echo 'hr-save-config-rejected-keeps-running-file:OK'
+else
+    echo "hr-save-config-rejected-keeps-running-file(survived=$survived got='$(cat "$sb_real_cfg" 2>/dev/null)'):FAIL"
+fi
+
+: > "$HR_SB_CHECK_OK"
+( sing_box_save_config ) > /dev/null 2>&1
+if [ "$(jq -c . "$sb_real_cfg" 2>/dev/null)" = '{"generation":"new"}' ]; then
+    echo 'hr-save-config-accepted-replaces-file:OK'
+else
+    echo "hr-save-config-accepted-replaces-file(got='$(cat "$sb_real_cfg" 2>/dev/null)'):FAIL"
 fi
 
 rm -rf "$HR_DIR"
