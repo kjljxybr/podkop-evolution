@@ -187,6 +187,13 @@ async function runSingBoxMutation(
       logger.error('[MANAGER]', 'runSingBoxMutation failed', result);
       showToast(result.message || _('Failed to execute!'), 'error');
     }
+
+    // Reported separately from the outcome: a core that did switch can still
+    // leave the package manager in a state that blocks later upgrades.
+    if (result.warning) {
+      logger.warn('[MANAGER]', 'runSingBoxMutation warning', result.warning);
+      showToast(result.warning, 'warning', 15000);
+    }
   } catch (error) {
     logger.error('[MANAGER]', 'runSingBoxMutation failed', error);
     showToast(_('Failed to execute!'), 'error');

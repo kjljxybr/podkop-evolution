@@ -4,6 +4,9 @@ export interface SingBoxComponentActionResult {
   success: boolean;
   version?: string;
   message?: string;
+  // Something the user has to fix by hand whatever the outcome, e.g. a pin
+  // the stable core switch had to leave in the apk world.
+  warning?: string;
 }
 
 // Shape echoed by `component_action_async sing_box <action>` on start.
@@ -26,6 +29,7 @@ export interface ComponentActionStatus {
   exit_code?: number | null;
   version?: string;
   latest_version?: string;
+  warning?: string;
 }
 
 // ~2s between polls; ~150 polls ≈ 5 min backstop against a wedged job.
@@ -71,6 +75,7 @@ export async function pollSingBoxComponentAction(
         success: Boolean(status.success),
         version: status.version,
         message: status.message,
+        warning: status.warning || undefined,
       };
     }
 

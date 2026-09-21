@@ -876,7 +876,8 @@ async function pollSingBoxComponentAction(fetchStatus, sleepFn = sleep, interval
       return {
         success: Boolean(status.success),
         version: status.version,
-        message: status.message
+        message: status.message,
+        warning: status.warning || void 0
       };
     }
     await sleepFn(intervalMs);
@@ -5513,6 +5514,10 @@ async function runSingBoxMutation(component, button) {
     } else {
       logger.error("[MANAGER]", "runSingBoxMutation failed", result);
       showToast(result.message || _("Failed to execute!"), "error");
+    }
+    if (result.warning) {
+      logger.warn("[MANAGER]", "runSingBoxMutation warning", result.warning);
+      showToast(result.warning, "warning", 15e3);
     }
   } catch (error) {
     logger.error("[MANAGER]", "runSingBoxMutation failed", error);
