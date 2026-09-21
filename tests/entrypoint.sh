@@ -7312,6 +7312,35 @@ else
     echo "hr-prepare-second-rule-gets-reference(defs=$(rule_set_defs main-remote-domains-ruleset) first=$(route_refs_in main-route-rule main-remote-domains-ruleset) second=$(route_refs_in second-route-rule main-remote-domains-ruleset)):FAIL"
 fi
 
+# CASE P7: the same rules for subnet rule sets — the decision is made by the
+#          source, not by the list type.
+for hr_src in user local remote; do
+    sn_path="$TMP_RULESET_FOLDER/main-$hr_src-subnets-ruleset.json"
+    printf '%s' '{"version":3,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}' > "$sn_path"
+    base_config
+    prepare_source_ruleset "main" "$hr_src" "subnets" "main-route-rule"
+    case "$hr_src" in
+    remote) sn_want='{"version":3,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}' ;;
+    *) sn_want='{"version":3,"rules":[]}' ;;
+    esac
+    if [ "$(jq -c . "$sn_path" 2>/dev/null)" = "$sn_want" ] && \
+        [ "$(route_refs "main-$hr_src-subnets-ruleset")" = "1" ]; then
+        echo "hr-prepare-$hr_src-subnets-file:OK"
+    else
+        echo "hr-prepare-$hr_src-subnets-file(got '$(cat "$sn_path" 2>/dev/null)' route=$(route_refs "main-$hr_src-subnets-ruleset")):FAIL"
+    fi
+done
+
+# ── read_proc_cmdline (real) ──────────────────────────────────────────
+# The process may be gone by the time /proc is read; that must not print a
+# "can't open" line into the log of every subscription update.
+hr_proc_err="$( (eval "$(extract read_proc_cmdline)"; read_proc_cmdline 999999) 2>&1 > /dev/null)"
+if [ -z "$hr_proc_err" ]; then
+    echo 'hr-proc-cmdline-gone-process-silent:OK'
+else
+    echo "hr-proc-cmdline-gone-process-silent(stderr='$hr_proc_err'):FAIL"
+fi
+
 # ── reload_sing_box_config_in_place ───────────────────────────────────
 # Stubs replace only the process boundary (pidof/kill), the full restart and
 # the heavy config generator. The generator stub behaves like the real one:
@@ -7334,7 +7363,9 @@ uci_get() {
 }
 # Fake process table. pidof lists every sing-box process in no particular order
 # and each pid's argv comes from HR_CMDLINE_<pid>: 4241 is one of the transient
-# helpers NetShift spawns (`check`), 4242 is the daemon started with `run`.
+# helpers NetShift spawns (`check`) on NetShift's config, 4242 is the daemon the
+# sing-box init script starts (argv as seen on a router), 4243 is another
+# `sing-box run` on a config that is not NetShift's.
 pidof() {
     [ "$1" = "sing-box" ] && [ -n "$HR_PIDS" ] || return 1
     printf '%s\n' "$HR_PIDS"
@@ -7342,14 +7373,22 @@ pidof() {
 read_proc_cmdline() {
     eval "printf '%s\n' \"\${HR_CMDLINE_$1:-}\""
 }
-HR_CMDLINE_4241='/usr/bin/sing-box
+HR_CMDLINE_4241="/usr/bin/sing-box
 -c
-/tmp/sing-box/config.json
-check'
-HR_CMDLINE_4242='/usr/bin/sing-box
+$hr_cfg
+check"
+HR_CMDLINE_4242="/usr/bin/sing-box
+run
+-c
+$hr_cfg
 -D
-/var/run/sing-box
-run'
+/usr/share/sing-box"
+HR_CMDLINE_4243='/usr/bin/sing-box
+run
+-c
+/etc/other-sing-box/config.json
+-D
+/var/lib/other-sing-box'
 kill() {
     printf '%s\n' "$*" >> "$HR_DIR/kill.log"
     [ "$HR_KILL_DIES" = "1" ] && HR_PIDS="4241"
@@ -7476,6 +7515,19 @@ else
     echo "hr-reload-daemon-gone-after-signal-restarts(rc=$rc kill='$(hr_kills)' restart=$(hr_count restart)):FAIL"
 fi
 
+# CASE R9: another `sing-box run` on a different config is listed first. It
+#          would take the signal just as well and apply nothing, so the signal
+#          goes to the daemon running NetShift's config.
+hr_reset
+HR_PIDS="4243 4241 4242"
+reload_sing_box_config_in_place
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_kills)" = "-HUP 4242" ] && [ "$(hr_count restart)" = "0" ]; then
+    echo 'hr-reload-foreign-daemon-not-signalled:OK'
+else
+    echo "hr-reload-foreign-daemon-not-signalled(rc=$rc kill='$(hr_kills)' restart=$(hr_count restart)):FAIL"
+fi
+
 # ── subscription_update applies a changed feed without a restart ──────
 eval "$(extract subscription_update)"
 
@@ -7504,8 +7556,12 @@ redact_url_for_log() { printf '%s' "$1"; }
 subscription_cache_is_usable() { return 0; }
 download_subscription_into_cache() {
     printf '%s' '{"outbounds":[{"type":"vless","tag":"node-1"}]}' > "$3"
+    # The process dies right after the changed body landed in the cache (OOM,
+    # SIGKILL) — before anything could be applied.
+    [ "$HR_DOWNLOAD_DIES" = "1" ] && exit 9
     return "$HR_DOWNLOAD_RC"
 }
+HR_DOWNLOAD_DIES=0
 reload_sing_box_config_in_place() {
     printf 'reload\n' >> "$HR_DIR/reload.log"
     return "$HR_RELOAD_RC"
@@ -7535,6 +7591,12 @@ if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "0" ] && [ "$(hr_count restart)" 
 else
     echo "hr-update-unchanged-feed-no-reload(rc=$rc reload=$(hr_count reload) restart=$(hr_count restart)):FAIL"
 fi
+# The marker set before the downloads is gone again: nothing was left to apply.
+if [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ]; then
+    echo 'hr-update-unchanged-feed-no-marker:OK'
+else
+    echo 'hr-update-unchanged-feed-no-marker(marker left behind):FAIL'
+fi
 
 # CASE U3: a failed reload is reported to the caller and remembered.
 rm -f "$HR_DIR/reload.log" "$HR_DIR/restart.log" "$SUBSCRIPTION_PENDING_APPLY_FLAG"
@@ -7542,7 +7604,7 @@ HR_DOWNLOAD_RC=0
 HR_RELOAD_RC=1
 subscription_update > /dev/null 2>&1
 rc=$?
-if [ "$rc" -ne 0 ] && [ "$(hr_count reload)" = "1" ]; then
+if [ "$rc" -eq "$SUBSCRIPTION_UPDATE_APPLY_FAILED" ] && [ "$(hr_count reload)" = "1" ]; then
     echo 'hr-update-reload-failure-propagates:OK'
 else
     echo "hr-update-reload-failure-propagates(rc=$rc reload=$(hr_count reload)):FAIL"
@@ -7567,6 +7629,139 @@ if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "1" ] && [ ! -f "$SUBSCRIPTION_PE
 else
     echo "hr-update-pending-apply-retried(rc=$rc reload=$(hr_count reload) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
 fi
+
+# CASE U5: the process dies right after the changed body was written into the
+#          cache, before the apply. The next run reads the feed as "unchanged";
+#          the change must still be applied.
+rm -f "$HR_DIR/reload.log" "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+HR_DOWNLOAD_RC=0
+HR_DOWNLOAD_DIES=1
+( subscription_update ) > /dev/null 2>&1
+HR_DOWNLOAD_DIES=0
+HR_DOWNLOAD_RC=2
+HR_RELOAD_RC=0
+subscription_update > /dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(hr_count reload)" = "1" ] && [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ]; then
+    echo 'hr-update-killed-after-cache-write-applied-next-run:OK'
+else
+    echo "hr-update-killed-after-cache-write-applied-next-run(rc=$rc reload=$(hr_count reload)):FAIL"
+fi
+
+# ── start_subscription_startup_retry_worker ───────────────────────────
+# The worker runs `/usr/bin/netshift subscription_update` in a child process;
+# the test swaps that one command for a stub fed from a list of exit codes, and
+# records every wait instead of sleeping.
+eval "$(extract start_subscription_startup_retry_worker | sed 's|/usr/bin/netshift subscription_update|hr_worker_update|')"
+config_load() { :; }
+# The first wait really pauses for a moment: the parent writes the pidfile right
+# after forking the worker, and a worker that finished before that would leave
+# the pidfile behind.
+sleep() {
+    printf '%s\n' "$1" >> "$HR_DIR/sleep.log"
+    [ "$1" = "10" ] && command sleep 1
+    return 0
+}
+hr_worker_update() {
+    printf 'update\n' >> "$HR_DIR/worker.log"
+    hr_worker_rc="$(sed -n "$(hr_count worker)p" "$HR_DIR/worker_rcs")"
+    return "${hr_worker_rc:-0}"
+}
+hr_worker_pidfile="/var/run/netshift_subscription_retry.pid"
+mkdir -p /var/run
+hr_worker_run() {
+    rm -f "$HR_DIR/worker.log" "$HR_DIR/sleep.log" "$hr_worker_pidfile"
+    printf '%s\n' "$@" > "$HR_DIR/worker_rcs"
+    start_subscription_startup_retry_worker
+    wait
+}
+hr_sleeps() {
+    tr '\n' ' ' < "$HR_DIR/sleep.log" 2>/dev/null | sed 's/ $//'
+}
+
+# CASE W1: an unreachable feed keeps being polled at the normal interval until
+#          it comes back — that is what the worker is for.
+hr_worker_run 1 1 0
+if [ "$(hr_count worker)" = "3" ] && [ "$(hr_sleeps)" = "10 30 30" ] && [ ! -f "$hr_worker_pidfile" ]; then
+    echo 'hr-worker-unreachable-feed-polled:OK'
+else
+    echo "hr-worker-unreachable-feed-polled(updates=$(hr_count worker) sleeps='$(hr_sleeps)'):FAIL"
+fi
+
+# CASE W2: feeds that download but never apply: the wait doubles, and after
+#          SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES failures in a row the worker
+#          stops and leaves the change to the scheduled update.
+hr_worker_run 3 3 3 3 3 3 3 3
+if [ "$(hr_count worker)" = "$SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES" ] && \
+    [ "$(hr_sleeps)" = "10 30 60 120 240" ] && [ ! -f "$hr_worker_pidfile" ]; then
+    echo 'hr-worker-apply-failures-back-off-and-stop:OK'
+else
+    echo "hr-worker-apply-failures-back-off-and-stop(updates=$(hr_count worker) sleeps='$(hr_sleeps)'):FAIL"
+fi
+
+# CASE W3: the doubled wait is capped, and a failed download in between neither
+#          counts as an apply failure nor resets the count.
+hr_saved_backoff_max="$SUBSCRIPTION_RETRY_BACKOFF_MAX"
+SUBSCRIPTION_RETRY_BACKOFF_MAX=45
+hr_worker_run 3 1 3 3 0
+SUBSCRIPTION_RETRY_BACKOFF_MAX="$hr_saved_backoff_max"
+if [ "$(hr_count worker)" = "5" ] && [ "$(hr_sleeps)" = "10 30 30 45 45" ]; then
+    echo 'hr-worker-backoff-capped:OK'
+else
+    echo "hr-worker-backoff-capped(updates=$(hr_count worker) sleeps='$(hr_sleeps)'):FAIL"
+fi
+
+# ── start_main and the pending-apply marker ───────────────────────────
+# Only a start that built a valid config may drop the marker: a rejected config
+# makes sing_box_init_config exit the process, and the change is still pending.
+eval "$(extract start_main | sed \
+    -e 's|/usr/sbin/ntpd|: ntpd|' \
+    -e 's|/etc/init.d/sing-box start|hr_sing_box_start|' \
+    -e 's|/var/run/netshift_list_update.pid|$HR_DIR/list_update.pid|')"
+TMP_RULESET_FOLDER="$HR_DIR/rulesets"
+migrate_legacy_subscription_url_option() { :; }
+check_requirements() { :; }
+migration() { :; }
+process_validate_service() { :; }
+br_netfilter_disable() { :; }
+migrate_subscription_cache_from_tmp() { :; }
+prepare_subscription_caches_for_startup() { subscription_startup_blocked=0; }
+stop_subscription_startup_retry_worker() { :; }
+route_table_rule_mark() { :; }
+create_nft_rules() { :; }
+sing_box_configure_service() { :; }
+add_cron_job() { :; }
+add_subscription_cron_job() { :; }
+list_update() { :; }
+hr_sing_box_start() { printf 'start\n' >> "$HR_DIR/sb_start.log"; }
+
+# CASE S1: the build succeeds -> the marker is dropped and sing-box started.
+rm -f "$HR_DIR/sb_start.log"
+mkdir -p "$TMP_SING_BOX_FOLDER"
+: > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+HR_BUILD_OK=1
+( start_main ) > /dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ "$(hr_count sb_start)" = "1" ]; then
+    echo 'hr-start-built-config-drops-marker:OK'
+else
+    echo "hr-start-built-config-drops-marker(rc=$rc started=$(hr_count sb_start) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
+fi
+
+# CASE S2: sing-box rejects the config -> start_main exits before the marker
+#          line, so the next subscription_update still applies the change.
+rm -f "$HR_DIR/sb_start.log"
+: > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+HR_BUILD_OK=0
+( start_main ) > /dev/null 2>&1
+rc=$?
+HR_BUILD_OK=1
+if [ "$rc" -ne 0 ] && [ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ "$(hr_count sb_start)" = "0" ]; then
+    echo 'hr-start-rejected-config-keeps-marker:OK'
+else
+    echo "hr-start-rejected-config-keeps-marker(rc=$rc started=$(hr_count sb_start) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
+fi
+unset -f sleep
 
 # ── the rebuild subshell against the REAL save path ───────────────────
 # R2 proves the caller survives a rejected config, but only against a stub that

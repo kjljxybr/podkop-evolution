@@ -835,6 +835,7 @@ start_subscription_startup_retry_worker() {
 
     (
         trap 'rm -f "'"$pidfile"'"' EXIT INT TERM
+        apply_failures=0
 
         # Let the primary sing-box instance come up first, so a configured
         # service proxy can be used for the post-bootstrap refresh.
@@ -843,18 +844,40 @@ start_subscription_startup_retry_worker() {
         while true; do
             config_load "$NETSHIFT_CONFIG"
 
-            # Run in a child process: a successful subscription_update performs
-            # its own restart, which stops this worker via the pidfile safely.
-            # Keep diagnostics visible in syslog; subscription URLs are redacted
-            # in the lower-level download helpers.
-            if /usr/bin/netshift subscription_update; then
+            # Run in a child process: subscription_update applies the change
+            # itself, and when that takes a restart, the restart stops this
+            # worker via the pidfile safely. Keep diagnostics visible in syslog;
+            # subscription URLs are redacted in the lower-level download helpers.
+            /usr/bin/netshift subscription_update
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
                 log "Deferred subscription refresh succeeded; updated configuration is being applied" "info"
                 rm -f "$pidfile"
                 exit 0
             fi
 
-            log "Deferred subscription refresh has not completed yet; retrying in background" "warn"
-            sleep 30
+            # An unreachable feed is what this worker exists for: keep polling
+            # until it comes back. A feed that downloads but does not apply is a
+            # different story — every pass re-downloads the feeds and rebuilds the
+            # config, and a config sing-box keeps rejecting will not start
+            # passing because it is rebuilt every 30 seconds. So back off, and
+            # after a few failures in a row hand over to the scheduled
+            # subscription update: the pending-apply marker makes that one retry
+            # the apply too.
+            delay="$SUBSCRIPTION_RETRY_INTERVAL"
+            if [ "$rc" -eq "$SUBSCRIPTION_UPDATE_APPLY_FAILED" ]; then
+                apply_failures=$((apply_failures + 1))
+                if [ "$apply_failures" -ge "$SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES" ]; then
+                    log "Deferred subscription refresh downloaded the feeds but could not apply them $apply_failures times in a row; leaving it to the scheduled subscription update" "error"
+                    rm -f "$pidfile"
+                    exit 1
+                fi
+                delay=$((SUBSCRIPTION_RETRY_INTERVAL * (1 << (apply_failures - 1))))
+                [ "$delay" -gt "$SUBSCRIPTION_RETRY_BACKOFF_MAX" ] && delay="$SUBSCRIPTION_RETRY_BACKOFF_MAX"
+            fi
+
+            log "Deferred subscription refresh has not completed yet; retrying in ${delay}s" "warn"
+            sleep "$delay"
         done
     ) &
 
@@ -903,8 +926,10 @@ start_main() {
 
     # sing-box
     sing_box_init_config
-    # A start builds the config from the current cache, so nothing can be left
-    # over for subscription_update to re-apply.
+    # The config was just built from the current cache, so nothing is left over
+    # for subscription_update to re-apply. Only a build that succeeded gets
+    # here: a config sing-box rejects makes sing_box_init_config exit the
+    # process first, and the marker then stays for the next subscription_update.
     rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
     config_foreach add_cron_job "section"
     config_foreach add_subscription_cron_job "section"
@@ -1909,25 +1934,37 @@ list_update() {
 
 # Reads a process's argv as one argument per line. Split out from
 # get_sing_box_daemon_pid so the test suite can supply a fake process table.
+# The stderr redirection comes first on purpose: the process may be gone by the
+# time /proc is read, and ash reports a failed `<` on whatever stderr is at that
+# point.
 read_proc_cmdline() {
-    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null
+    tr '\0' '\n' 2>/dev/null <"/proc/$1/cmdline"
 }
 
-# The pid of the long-running sing-box daemon, or nothing.
+# The pid of the long-running sing-box daemon that runs config file $1, or
+# nothing.
 #
 # `pidof sing-box | awk '{print $1}'` is not good enough: NetShift itself spawns
 # short-lived sing-box processes (`rule-set decompile`, `tools fetch`, `check`),
 # pidof lists them in no defined order, and a signal sent to one of those is
 # simply lost when it exits — while the daemon keeps running the old config and
 # the caller reports success. The daemon is the process started with the `run`
-# subcommand; the transient ones never carry it. Matching the argument exactly
-# (rather than a substring of the command line) keeps flags and paths from
-# producing a false positive.
+# subcommand, which the transient ones never carry; and it is NetShift's daemon
+# only if it was started on NetShift's config file (the sing-box init script
+# passes it as `-c <file>`), since another `sing-box run` on the router would
+# take the signal just as well and apply nothing. Arguments are matched whole,
+# not as substrings of the command line, so flags and paths cannot produce a
+# false positive.
 get_sing_box_daemon_pid() {
+    local config_path="$1"
     local pid
 
     for pid in $(pidof sing-box 2>/dev/null); do
-        if read_proc_cmdline "$pid" | grep -qx 'run'; then
+        if read_proc_cmdline "$pid" | awk -v config_path="$config_path" '
+            $0 == "run" { run = 1 }
+            previous == "-c" && $0 == config_path { own = 1 }
+            { previous = $0 }
+            END { exit !(run && own) }'; then
             printf '%s' "$pid"
             return 0
         fi
@@ -1946,13 +1983,6 @@ get_sing_box_daemon_pid() {
 reload_sing_box_config_in_place() {
     local sing_box_pid config_path service_conffile hash_before hash_after settle
 
-    sing_box_pid="$(get_sing_box_daemon_pid)"
-    if [ -z "$sing_box_pid" ]; then
-        echolog "ℹ️ No running sing-box daemon found; restarting netshift"
-        restart
-        return $?
-    fi
-
     config_get config_path "settings" "config_path"
 
     # A running daemon reads the file it was started with. sing_box_configure_service
@@ -1962,7 +1992,14 @@ reload_sing_box_config_in_place() {
     # would report success having applied nothing.
     service_conffile="$(uci_get "sing-box" "main" "conffile")"
     if [ "$service_conffile" != "$config_path" ]; then
-        echolog "ℹ️ sing-box runs with a different config file ($service_conffile); restarting netshift"
+        echolog "ℹ️ The sing-box service uses a different config file ($service_conffile); restarting netshift"
+        restart
+        return $?
+    fi
+
+    sing_box_pid="$(get_sing_box_daemon_pid "$config_path")"
+    if [ -z "$sing_box_pid" ]; then
+        echolog "ℹ️ No running sing-box daemon found; restarting netshift"
         restart
         return $?
     fi
@@ -1998,7 +2035,7 @@ reload_sing_box_config_in_place() {
     # restart. So wait for the reload to settle and require the same daemon.
     settle="${SING_BOX_RELOAD_SETTLE_DELAY:-3}"
     [ "$settle" -gt 0 ] && sleep "$settle"
-    if [ "$(get_sing_box_daemon_pid)" != "$sing_box_pid" ]; then
+    if [ "$(get_sing_box_daemon_pid "$config_path")" != "$sing_box_pid" ]; then
         echolog "⚠️ sing-box did not survive the config reload; restarting netshift"
         restart
         return $?
@@ -2157,17 +2194,27 @@ subscription_update() {
 
         echolog "ℹ️ Subscription for section '$section' is unchanged"
     }
-    config_foreach _update_subscription_for_section "section"
-
-    # download_subscription_into_cache stores the body and only then compares it,
-    # so a change that was downloaded but never applied reads as "unchanged" on
-    # every later run: updated_sections stays 0, this function returns early, and
-    # the router keeps the old outbounds while the log says "no changes detected".
-    # The marker written before each apply is what breaks that standoff.
+    # download_subscription_into_cache stores a changed body in the cache and only
+    # then reports the change, so a change that was cached but never applied
+    # reads as "unchanged" on every later run: updated_sections stays 0, this
+    # function returns early, and the router keeps the old outbounds while the
+    # log says "no changes detected". The pending-apply marker breaks that
+    # standoff, and it has to be in place BEFORE the first feed is downloaded:
+    # the cache can be ahead of sing-box from that write on, and a run killed
+    # anywhere after it (OOM, kill, a crash while other sections are still
+    # downloading) must leave the marker behind. It is cleared only once nothing
+    # is left to apply. A marker left by an earlier run is read first; a stale
+    # one (a restart from elsewhere applied the cache already) costs one extra
+    # rebuild that finds an identical config.
     pending_apply=0
     [ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && pending_apply=1
+    mkdir -p "$TMP_SING_BOX_FOLDER"
+    : > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+
+    config_foreach _update_subscription_for_section "section"
 
     if [ "$updated_sections" -eq 0 ] && [ "$pending_apply" -eq 0 ]; then
+        rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
         if [ "$failed_sections" -gt 0 ]; then
             echolog "❌ Subscription update finished with errors; keeping the last working cache"
             return 1
@@ -2183,17 +2230,12 @@ subscription_update() {
         echolog "🔄 Applying updated subscriptions..."
     fi
 
-    # Set before the apply, cleared only after it succeeded. A stale marker (a
-    # restart from elsewhere applied the cache already) costs one extra rebuild
-    # that finds an identical config and clears it again.
-    mkdir -p "$TMP_SING_BOX_FOLDER"
-    : > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
-
+    # The marker stays until the apply succeeded.
     reload_sing_box_config_in_place
     apply_rc=$?
     if [ "$apply_rc" -ne 0 ]; then
-        echolog "❌ Subscription was downloaded, but applying it failed; the next update will retry it"
-        return "$apply_rc"
+        echolog "❌ Subscription was downloaded, but applying it failed (rc=$apply_rc); the next update will retry it"
+        return "$SUBSCRIPTION_UPDATE_APPLY_FAILED"
     fi
     rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 
