@@ -1829,7 +1829,13 @@ get_subscription_cron_line_for_interval() {
 # created per distinct value, so every section is updated on the interval its own
 # option asks for no matter where it sits in the UCI order — the bug was a single
 # job built from whichever section came last, which then drove every section on
-# that one interval. Unknown values are skipped (and logged), as before.
+# that one interval.
+#
+# An unknown value falls back to SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT (warned
+# about) instead of being dropped: a section left out of every job would simply
+# stop being refreshed, which is what the pre-#51 single interval-less job did
+# not do. The absent option takes the same default, so an upgrade keeps its
+# previous hourly refresh.
 _collect_subscription_update_interval() {
     local section="$1"
     local connection_type proxy_config_type subscription_update_interval
@@ -1840,10 +1846,10 @@ _collect_subscription_update_interval() {
     config_get proxy_config_type "$section" "proxy_config_type"
     [ "$proxy_config_type" = "subscription" ] || return 0
 
-    config_get subscription_update_interval "$section" "subscription_update_interval" "1h"
+    config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
     if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null; then
-        log "Invalid subscription_update_interval value: $subscription_update_interval"
-        return 0
+        log "Unknown subscription_update_interval '$subscription_update_interval' in section '$section', using $SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT" "warn"
+        subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
     fi
 
     SUBSCRIPTION_UPDATE_INTERVALS="$SUBSCRIPTION_UPDATE_INTERVALS $subscription_update_interval"
@@ -2085,6 +2091,12 @@ reload_sing_box_config_in_place() {
 # whose subscription_update_interval is that value. The cron jobs run one per
 # distinct interval and pass theirs, so a section is refreshed on the schedule
 # its own option asks for regardless of the UCI order.
+#
+# An argument the cron table does not know is not a filter that matches nothing:
+# `netshift subscription_update 2h` used to update no section at all and still
+# exit 0. Such a call refreshes every section instead (and says so), so a typo on
+# the command line, or a cron line carrying an interval this version no longer
+# schedules, cannot silently stop refreshing the subscriptions.
 subscription_update() {
     echolog "🔄 Starting subscription update..."
 
@@ -2094,6 +2106,11 @@ subscription_update() {
     local failed_sections=0
     local pending_apply=0
     local apply_rc=0
+
+    if [ -n "$target_interval" ] && ! get_subscription_cron_line_for_interval "$target_interval" > /dev/null; then
+        echolog "⚠️ Unknown subscription update interval '$target_interval', updating every subscription section" "warn"
+        target_interval=""
+    fi
 
     # True when the section takes part in this run: a subscription section, and
     # carrying the requested interval when the caller named one.
@@ -2108,7 +2125,13 @@ subscription_update() {
         [ "$proxy_config_type" = "subscription" ] || return 1
 
         if [ -n "$target_interval" ]; then
-            config_get subscription_update_interval "$section" "subscription_update_interval" "1h"
+            config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            # The same fallback the cron collector applies: a section whose stored
+            # value is unknown runs on the default, so the job built for the
+            # default is the job that updates it.
+            if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null; then
+                subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            fi
             [ "$subscription_update_interval" = "$target_interval" ] || return 1
         fi
 
@@ -5486,7 +5509,8 @@ Available commands:
     main                    Run main NetShift process
     list_update             Update domain lists
     subscription_update     Update subscription proxies; with an interval
-                            (30m|1h|3h|6h|12h|1d) only the sections using it
+                            (30m|1h|3h|6h|12h|1d) only the sections using it,
+                            an unknown interval updates every section
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
