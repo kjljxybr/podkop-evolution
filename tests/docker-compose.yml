@@ -12,8 +12,8 @@
 #             nftv6, selmark, isolation, monfd, unsupported, textlist,
 #             chunkcheck, diagnostics, subscription, fastest, insecure, rejected,
 #             jobstate, selfheal, dnsdetour, ecssubnet, suburlopt, subcron, globalproxy,
-#             stablecheck, extcheck, sbextarch, netshiftcheck, latesttag, ghredirect,
-#             selfupdate, backupguard, hotreload, domsep, domcase
+#             bittorrent, stablecheck, extcheck, sbextarch, netshiftcheck, latesttag,
+#             ghredirect, selfupdate, backupguard, hotreload, domsep, domcase
 # ──────────────────────────────────────────────────────────────────
 
 services:

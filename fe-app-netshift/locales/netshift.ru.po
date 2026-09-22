@@ -347,6 +347,9 @@ msgstr "Каждый день"
 msgid "Every hour"
 msgstr "Каждый час"
 
+msgid "Exclude BitTorrent"
+msgstr "Исключить BitTorrent"
+
 msgid "Exclude NTP"
 msgstr "Исключить NTP"
 
@@ -724,6 +727,9 @@ msgstr "Перезапустить NetShift"
 
 msgid "Route all unmatched traffic through this section's outbound."
 msgstr "Направлять весь несовпавший трафик через outbound этой секции."
+
+msgid "Route BitTorrent traffic directly, bypassing the proxy or VPN. Some providers block subscriptions when they detect torrent traffic."
+msgstr "Направлять трафик BitTorrent напрямую, минуя прокси или VPN. Некоторые провайдеры блокируют подписки, обнаружив торрент-трафик."
 
 msgid "Route main DNS through proxy/VPN"
 msgstr "Основной DNS через прокси/VPN"

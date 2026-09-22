@@ -3288,6 +3288,22 @@ sing_box_configure_route() {
     sniff_inbounds=$(comma_string_to_json_array "$sniff_inbounds_csv")
     config=$(sing_box_cm_sniff_route_rule "$config" "inbound" "$sniff_inbounds")
 
+    # BitTorrent exclusion (settings.exclude_bittorrent, default off). The rule
+    # matches the SNIFFED protocol, so it MUST stay after the sniff rule above —
+    # placed earlier, `protocol` is still unknown and the rule never matches.
+    # Beyond that it sits first among the routing rules, ahead of the block /
+    # exclusion / per-section rules, so torrent traffic can never be pulled into
+    # the tunnel: the whole point of the option is that a strict provider never
+    # sees BitTorrent at all. An absent or 0 option adds no rule, so configs
+    # written before this option existed generate a byte-identical config.
+    local exclude_bittorrent
+    config_get_bool exclude_bittorrent "settings" "exclude_bittorrent" 0
+    if [ "$exclude_bittorrent" -eq 1 ]; then
+        log "BitTorrent exclusion enabled: routing BitTorrent traffic directly, bypassing the tunnel" "info"
+        config=$(sing_box_cm_add_bittorrent_direct_route_rule "$config" "$SB_BITTORRENT_DIRECT_RULE_TAG" \
+            "$SB_TPROXY_INBOUND_TAG" "$SB_DIRECT_OUTBOUND_TAG")
+    fi
+
     config=$(sing_box_cm_add_hijack_dns_route_rule "$config" "protocol" "dns")
 
     local disable_quic

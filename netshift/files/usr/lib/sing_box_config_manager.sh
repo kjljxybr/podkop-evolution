@@ -1290,6 +1290,34 @@ sing_box_cm_add_route_rule() {
 }
 
 #######################################
+# Add a route rule that sends BitTorrent traffic out directly instead of through
+# the tunnel. BitTorrent is matched on the SNIFFED protocol, so the caller MUST
+# insert this rule AFTER the sniff rule in route.rules: placed earlier, the
+# protocol is not known yet when the rule is evaluated and it silently never
+# matches.
+# Arguments:
+#   config: string (JSON), sing-box configuration to modify
+#   tag: string, identifier for the route rule
+#   inbound: string, inbound tag to match
+#   outbound: string, outbound tag the BitTorrent traffic is routed to
+# Outputs:
+#   Writes updated JSON configuration to stdout
+# Example:
+#   CONFIG=$(sing_box_cm_add_bittorrent_direct_route_rule "$CONFIG" "bittorrent-direct-rule-tag" "tproxy-in" "direct-out")
+#######################################
+sing_box_cm_add_bittorrent_direct_route_rule() {
+    local config="$1"
+    local tag="$2"
+    local inbound="$3"
+    local outbound="$4"
+
+    config=$(sing_box_cm_add_route_rule "$config" "$tag" "$inbound" "$outbound")
+    config=$(sing_box_cm_patch_route_rule "$config" "$tag" "protocol" "bittorrent")
+
+    echo "$config"
+}
+
+#######################################
 # Insert a resolve rule immediately before a route rule.
 # Copies rule_set from the target route rule.
 # Arguments:
