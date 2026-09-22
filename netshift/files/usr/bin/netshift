@@ -3131,6 +3131,25 @@ sing_box_configure_dns() {
 
     config=$(sing_box_cm_add_udp_dns_server "$config" "$SB_BOOTSTRAP_SERVER_TAG" "$bootstrap_dns_server" 53)
     config=$(sing_box_cf_add_dns_server "$config" "$dns_type" "$SB_DNS_SERVER_TAG" "$dns_server" "$dns_domain_resolver" "$dns_detour_tag")
+
+    # EDNS Client Subnet (ECS, RFC 7871): append the configured IP prefix to
+    # every DNS query so geo-distributed services resolve to the node closest
+    # to the client. Absent/empty (the default, and every config upgraded from
+    # an older package, where the option simply does not exist) adds no field
+    # at all, so the DNS section stays byte-identical to the pre-feature output.
+    # An unusable value is only warned about and skipped: passing it on would
+    # make sing_box_config_check reject the WHOLE config and exit 1, i.e. a
+    # typo in an optional field would stop the service from starting.
+    local dns_client_subnet
+    config_get dns_client_subnet "settings" "dns_client_subnet" ""
+    if [ -n "$dns_client_subnet" ]; then
+        if is_ip_or_ip_prefix "$dns_client_subnet"; then
+            config=$(sing_box_cm_set_dns_client_subnet "$config" "$dns_client_subnet")
+        else
+            log "Ignoring invalid EDNS Client Subnet '$dns_client_subnet': expected an IP address or prefix (e.g. 203.0.113.0/24 or 2001:db8::/32)" "warn"
+        fi
+    fi
+
     if netshift_ipv6_enabled; then
         config=$(sing_box_cm_add_fakeip_dns_server "$config" "$SB_FAKEIP_DNS_SERVER_TAG" "$SB_FAKEIP_INET4_RANGE" "$SB_FAKEIP_INET6_RANGE")
     else

@@ -3,6 +3,11 @@ config settings 'settings'
         option dns_server '77.88.8.8'
         option bootstrap_dns_server '77.88.8.8'
         option dns_rewrite_ttl '60'
+        # EDNS Client Subnet (RFC 7871): IP address or prefix sent with every
+        # DNS query so geo-distributed services resolve to the node closest to
+        # the client. Empty/unset disables it (this is the default, and configs
+        # upgraded from an older package have no such option at all).
+        option dns_client_subnet ''
         list source_network_interfaces 'br-lan'
         option enable_output_network_interface '0'
         #option output_network_interface 'wan'

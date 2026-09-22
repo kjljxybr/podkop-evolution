@@ -7,8 +7,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: NETSHIFT\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-06-13 14:14+0300\n"
-"PO-Revision-Date: 2026-06-13 14:14+0300\n"
+"POT-Creation-Date: 2026-09-22 19:15+0300\n"
+"PO-Revision-Date: 2026-09-22 19:15+0300\n"
 "Last-Translator: yandexru45\n"
 "Language-Team: none\n"
 "Language: ru\n"
@@ -271,6 +271,9 @@ msgstr "Исключать серверы подписки, имя которы�
 
 msgid "Dynamic List"
 msgstr "Динамический список"
+
+msgid "EDNS Client Subnet"
+msgstr "EDNS Client Subnet (ECS)"
 
 msgid "Enable autostart"
 msgstr "Включить автостарт"
@@ -820,6 +823,9 @@ msgstr "Прокси-ссылки Selector (по одной в строке)"
 
 msgid "Self-update failed"
 msgstr "Не удалось обновить"
+
+msgid "Send this IP address or prefix with every DNS query (EDNS Client Subnet, RFC 7871), so geo-distributed services resolve to the node closest to you. Leave empty to disable."
+msgstr "Отправлять этот IP-адрес или префикс с каждым DNS-запросом (EDNS Client Subnet, RFC 7871), чтобы геораспределённые сервисы определяли ближайший к вам узел. Оставьте пустым, чтобы отключить."
 
 msgid "Send upstream DNS queries through a proxy/VPN outbound instead of directly. Bootstrap DNS always stays direct."
 msgstr "Отправлять запросы к основному DNS через outbound прокси/VPN вместо прямого подключения. Bootstrap DNS всегда остаётся прямым."
