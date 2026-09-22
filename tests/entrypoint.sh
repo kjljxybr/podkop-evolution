@@ -267,6 +267,14 @@ url_get_host 'https://example.com:8080/path' | grep -q 'example.com' && echo 'ur
 url_get_port 'https://example.com:8080/path' | grep -q '8080' && echo 'url-port:OK' || echo 'url-port:FAIL'
 url_get_port 'http://[::1]:443/test' | grep -q '443' && echo 'url-ipv6-port:OK' || echo 'url-ipv6-port:FAIL'
 
+# Test URL decoding (issue #50). url_decode keeps the form-encoded '+'->space
+# rule (query values); url_decode_component decodes a single URI component and
+# preserves '+'. Both must leave a '%' that is not a valid escape untouched.
+[ "$(url_decode 'a+b%40c')" = 'a b@c' ] && echo 'url-decode:OK' || echo "url-decode:FAIL (got='$(url_decode 'a+b%40c')')"
+[ "$(url_decode_component 'a+b%40c')" = 'a+b@c' ] && echo 'url-decode-component:OK' || echo "url-decode-component:FAIL (got='$(url_decode_component 'a+b%40c')')"
+[ "$(url_decode_component '50%off')" = '50%off' ] && echo 'url-decode-bare-percent:OK' || echo "url-decode-bare-percent:FAIL (got='$(url_decode_component '50%off')')"
+[ "$(url_get_query_param 'vless://x@h:1?path=%2Fa%2Bb&sni=s' 'path')" = '/a+b' ] && echo 'url-query-param-decode:OK' || echo "url-query-param-decode:FAIL (got='$(url_get_query_param 'vless://x@h:1?path=%2Fa%2Bb&sni=s' 'path')')"
+
 echo 'DONE'
 TESTEOF
 
@@ -2520,6 +2528,125 @@ VMEOF
         fail "vmess-driver-completed:FAIL (driver aborted early)"
     fi
     rm -f "$vm_tmp" "$vm_out"
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Test: Proxy Link Escaping (issue #50)
+# ─────────────────────────────────────────────────────────────────
+# The link must be parsed as a URI FIRST and only then must its components be
+# percent-decoded. Decoding the whole link up front turned an escaped '%40' /
+# '%23' inside a password into a structural '@' / '#' (wrong split point, or the
+# fragment stripping everything after it) and rewrote a literal '+' into a space.
+#
+# Upgrade safety: this fix adds NO new UCI option, so an existing (conffile)
+# /etc/config/netshift is untouched by design. What must not change is the
+# parsing of ordinary links, which the 'plain-link-unchanged' token pins down by
+# comparing the generated outbound with the exact pre-fix JSON.
+test_proxy_link_escaping() {
+    header "Proxy Link Escaping (%40 / %23 / '+')"
+
+    local facade_lib="${NETSHIFT_LIB_DIR}/sing_box_config_facade.sh"
+    if [ ! -r "$facade_lib" ]; then
+        fail "sing_box_config_facade.sh not found"
+        return
+    fi
+
+    # The facade hardcodes NETSHIFT_LIB="/usr/lib/netshift" for its own sourcing
+    # of helpers.sh + sing_box_config_manager.sh; bind the bind-mounted sources
+    # to that runtime path so the facade resolves them in the container.
+    mkdir -p /usr/lib/netshift
+    ln -sf "${NETSHIFT_LIB_DIR}/helpers.sh" /usr/lib/netshift/helpers.sh
+    ln -sf "${NETSHIFT_LIB_DIR}/sing_box_config_manager.sh" /usr/lib/netshift/sing_box_config_manager.sh
+
+    local drv="/tmp/test-proxy-link-$$.sh"
+    cat > "$drv" << 'LINKEOF'
+. "NETSHIFT_LIB/logging.sh" 2>/dev/null || log() { :; }
+. "FACADE_LIB_PATH"
+
+base='{"outbounds":[]}'
+
+# check <token> <jq-filter> <link>
+check() {
+    tok="$1"; filt="$2"; link="$3"
+    out=$(sing_box_cf_add_proxy_outbound "$base" "demo" "$link" "0" 2>/dev/null)
+    if printf '%s' "$out" | jq -e "$filt" > /dev/null 2>&1; then
+        echo "$tok:OK"
+    else
+        echo "$tok:FAIL (got=$(printf '%s' "$out" | jq -c '.outbounds[0] // .' 2>/dev/null))"
+    fi
+}
+
+# ── issue #50 examples ───────────────────────────────────────────────
+check trojan-pct40 '.outbounds[0].password == "abc@def" and .outbounds[0].server == "example.com" and .outbounds[0].server_port == 443' 'trojan://abc%40def@example.com:443?security=tls'
+check trojan-plus '.outbounds[0].password == "abc+def"' 'trojan://abc+def@example.com:443?security=tls'
+check trojan-pct23 '.outbounds[0].password == "abc#def" and .outbounds[0].server == "example.com" and .outbounds[0].server_port == 443' 'trojan://abc%23def@example.com:443?security=tls'
+check trojan-mixed '.outbounds[0].password == "a@b#c+d"' 'trojan://a%40b%23c+d@example.com:443'
+check trojan-utf8 '.outbounds[0].password == "пароль"' 'trojan://%D0%BF%D0%B0%D1%80%D0%BE%D0%BB%D1%8C@example.com:443'
+check trojan-fragment '.outbounds[0].password == "abc@def"' 'trojan://abc%40def@example.com:443#DE%20Frankfurt'
+
+# ── other schemes go through the same component extraction ───────────
+check hy2-escaped-password '.outbounds[0].password == "p#ss@word+1"' 'hysteria2://p%23ss%40word+1@h.example.com:8443?sni=h.example.com'
+check socks-escaped-password '.outbounds[0].username == "user" and .outbounds[0].password == "p@ss"' 'socks5://user:p%40ss@example.com:1080'
+
+# Shadowsocks userinfo base64 contains '+' (base64 alphabet index 62): the body
+# must survive verbatim, so this outbound can only be built from the raw link.
+ss_b64=$(printf '%s' 'aes-256-gcm:ab>' | base64 | tr -d '\n')
+case "$ss_b64" in
+*+*) echo 'ss-base64-plus-fixture:OK' ;;
+*) echo "ss-base64-plus-fixture:FAIL (b64=$ss_b64)" ;;
+esac
+check ss-base64-plus ".outbounds[0].method == \"aes-256-gcm\" and .outbounds[0].password == \"ab>\"" "ss://$ss_b64@ss.example.com:8388"
+
+# ── query values: still decoded, legacy '+'->space preserved ─────────
+check query-value-percent '.outbounds[0].transport.path == "/ws+path"' 'vless://11111111-2222-3333-4444-555555555555@v.example.com:443?security=tls&type=ws&path=%2Fws%2Bpath&host=cdn.example.com'
+check query-value-plus-space '.outbounds[0].transport.path == "/a b"' 'vless://11111111-2222-3333-4444-555555555555@v.example.com:443?security=tls&type=ws&path=/a+b&host=cdn.example.com'
+
+# ── upgrade safety: an ordinary link must yield the pre-fix JSON ─────
+check plain-link-unchanged '.outbounds[0] == {"type":"trojan","tag":"demo-out","server":"example.com","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"example.com"}}' 'trojan://pw@example.com:443?security=tls&sni=example.com'
+
+# ── the generated config must still pass sing-box check ──────────────
+if command -v sing-box > /dev/null 2>&1; then
+    for pw in 'abc%40def' 'abc%23def' 'abc+def'; do
+        out=$(sing_box_cf_add_proxy_outbound "$base" "demo" "trojan://$pw@example.com:443?security=tls" 0 2>/dev/null)
+        printf '%s' "$out" | jq -c '{log:{disabled:true,level:"warn"},outbounds:.outbounds}' > /tmp/proxy-link-check.json 2>/dev/null
+        if sing-box -c /tmp/proxy-link-check.json check > /dev/null 2>&1; then
+            echo "singbox-check-$pw:OK"
+        else
+            echo "singbox-check-$pw:FAIL ($(sing-box -c /tmp/proxy-link-check.json check 2>&1 | head -2 | tr '\n' ' '))"
+        fi
+    done
+    rm -f /tmp/proxy-link-check.json
+else
+    echo 'singbox-check-pct23:SKIP'
+fi
+
+echo DONE
+LINKEOF
+    sed -i "s|FACADE_LIB_PATH|$facade_lib|; s|NETSHIFT_LIB|$NETSHIFT_LIB_DIR|g" "$drv"
+
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite.
+    local link_out="/tmp/test-proxy-link-out-$$.log"
+    sh "$drv" > "$link_out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "$line" ;;
+            # The driver appends the offending JSON in parentheses, so the FAIL
+            # token is not at the end of the line (case patterns must match the
+            # WHOLE line).
+            *:FAIL*) fail "$line" ;;
+            *:SKIP) skip "$line" ;;
+            DONE) saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$link_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "proxy-link-driver-completed:OK"
+    else
+        fail "proxy-link-driver-completed:FAIL (driver aborted early)" "$(tail -5 "$link_out" 2>/dev/null)"
+    fi
+    rm -f "$drv" "$link_out"
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -8795,6 +8922,7 @@ main() {
             test_jq_helpers
             test_config_manager
             test_sing_box_config
+            test_proxy_link_escaping
             test_nft
             test_nft_ipv6
             test_selective_marking
@@ -8859,9 +8987,10 @@ main() {
         jq)          test_jq_helpers ;;
         cm)          test_config_manager ;;
         sb)          test_sing_box_config ;;
+        proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac
