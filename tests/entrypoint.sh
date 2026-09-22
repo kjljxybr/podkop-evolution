@@ -6545,6 +6545,298 @@ DDEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: EDNS Client Subnet (issue #36)
+# ─────────────────────────────────────────────────────────────────
+# Exercises the REAL DNS-section generator (sing_box_configure_dns extracted
+# verbatim from the CLI) with the REAL libraries, stubbing only UCI, and covers
+# the upgrade path explicitly: `dns_client_subnet` is a NEW option, and an
+# existing /etc/config/netshift is preserved as a conffile on upgrade, so the
+# option is simply MISSING for every upgraded user. That case must produce a
+# DNS section with no client_subnet field at all (byte-identical to the
+# pre-#36 output) and must still pass `sing-box check`. The option being set
+# must add .dns.client_subnet, and an invalid value must be skipped with a
+# warning instead of poisoning the whole config (sing_box_config_check would
+# otherwise exit 1 and the service would never start).
+test_dns_client_subnet() {
+    header "EDNS Client Subnet (issue #36)"
+
+    if ! command -v jq > /dev/null 2>&1; then
+        skip "jq not available"
+        return
+    fi
+
+    local lib="${NETSHIFT_LIB_DIR}"
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    local config_file="${NETSHIFT_SRC}/etc/config/netshift"
+    if [ ! -r "$bin" ] || [ ! -r "$lib/helpers.sh" ]; then
+        skip "ecssubnet — libs / bin not found"
+        return
+    fi
+
+    # The shipped default must document the option AND default it to off, so a
+    # fresh install cannot silently turn ECS on.
+    if [ -r "$config_file" ] && grep -q "option dns_client_subnet ''" "$config_file"; then
+        pass "shipped config ships dns_client_subnet empty (feature off by default)"
+    else
+        fail "shipped config is missing an empty 'option dns_client_subnet'"
+    fi
+
+    # Bind bind-mounted sources to the runtime path the libs hardcode.
+    mkdir -p /usr/lib/netshift
+    ln -sf "${lib}/helpers.sh" /usr/lib/netshift/helpers.sh
+    ln -sf "${lib}/helpers.jq" /usr/lib/netshift/helpers.jq
+    ln -sf "${lib}/sing_box_config_manager.sh" /usr/lib/netshift/sing_box_config_manager.sh
+    ln -sf "${lib}/constants.sh" /usr/lib/netshift/constants.sh
+
+    local drv="/tmp/netshift-ecssubnet-$$.sh"
+    cat > "$drv" << 'ECSEOF'
+. "NETSHIFT_LIB/constants.sh"
+. "NETSHIFT_LIB/helpers.sh"
+. "NETSHIFT_LIB/sing_box_config_manager.sh"
+. "NETSHIFT_LIB/sing_box_config_facade.sh"
+
+if command -v sing-box > /dev/null 2>&1; then
+    ECS_SB=1
+else
+    ECS_SB=0
+fi
+
+# Capture log output instead of writing to syslog: the feature must only ever
+# WARN about a bad value, never abort.
+LOG_LINES=""
+log() {
+    if [ -n "$LOG_LINES" ]; then
+        LOG_LINES="$LOG_LINES
+[$2] $1"
+    else
+        LOG_LINES="[$2] $1"
+    fi
+}
+
+# REAL functions, extracted verbatim from the shipped CLI (same awk trick the
+# other tests use): the DNS-section generator plus the helpers it calls.
+eval "$(awk '/^sing_box_configure_dns\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+eval "$(awk '/^netshift_ipv6_enabled\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+eval "$(awk '/^_get_dns_detour_tag\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+
+# UCI stubs: option values live in UCI_<section>_<option>; an UNSET variable
+# reproduces an option missing from /etc/config/netshift (the upgrade case).
+# The fallback mirrors config_get's ${CONFIG_x:-default} semantics.
+config_get() {
+    local _var="$1" _sec="$2" _opt="$3" _def="${4-}"
+    local _val
+    eval "_val=\"\${UCI_${_sec}_${_opt}:-}\""
+    [ -n "$_val" ] || _val="$_def"
+    eval "$_var=\"\$_val\""
+    return 0
+}
+config_get_bool() { config_get "$@"; }
+
+reset_settings() {
+    UCI_settings_dns_type="udp"
+    UCI_settings_dns_server="1.1.1.1"
+    UCI_settings_bootstrap_dns_server="77.88.8.8"
+    UCI_settings_block_doh="0"
+    UCI_settings_enable_ipv6="0"
+    UCI_settings_dns_rewrite_ttl="60"
+    UCI_settings_dns_via_outbound="0"
+    unset UCI_settings_dns_client_subnet
+}
+
+build_dns_config() {
+    config='{"log":{},"dns":{},"ntp":{},"certificate":{},"endpoints":[],"inbounds":[],"outbounds":[],"route":{},"services":[],"experimental":{}}'
+    LOG_LINES=""
+    # sing_box_configure_dns mutates the global `config` in place (no echo).
+    sing_box_configure_dns
+}
+
+# Save with the PRODUCTION writer (it strips the internal __service_tag marker
+# that sing-box refuses) and validate with the real binary.
+config_passes_sing_box_check() {
+    sing_box_cm_save_config_to_file "$config" /tmp/ecs-check.json
+    sing-box -c /tmp/ecs-check.json check > /dev/null 2>&1
+}
+
+sb_check_token() {
+    if [ "$ECS_SB" -eq 0 ]; then
+        echo "$1:SKIP"
+    elif config_passes_sing_box_check; then
+        echo "$1:OK"
+    else
+        echo "$1:FAIL"
+    fi
+}
+
+# ══ 1. UPGRADE SIMULATION: option ABSENT from UCI ═══════════════════════════
+reset_settings
+build_dns_config
+if printf '%s' "$config" | jq -e '.dns | has("client_subnet") | not' > /dev/null 2>&1; then
+    echo 'ecs-absent-no-field:OK'
+else
+    echo 'ecs-absent-no-field:FAIL'
+fi
+absent_servers=$(printf '%s' "$config" | jq -cS '.dns.servers')
+sb_check_token 'ecs-absent-singbox-check'
+
+# An explicitly empty value (what the shipped default config holds) must behave
+# exactly like the absent option.
+reset_settings
+UCI_settings_dns_client_subnet=""
+build_dns_config
+if printf '%s' "$config" | jq -e '.dns | has("client_subnet") | not' > /dev/null 2>&1; then
+    echo 'ecs-empty-no-field:OK'
+else
+    echo 'ecs-empty-no-field:FAIL'
+fi
+
+# ══ 2. Option SET: IPv4 prefix / bare address / IPv6 prefix ═════════════════
+reset_settings
+UCI_settings_dns_client_subnet="203.0.113.0/24"
+build_dns_config
+val=$(printf '%s' "$config" | jq -r '.dns.client_subnet // "MISSING"')
+[ "$val" = "203.0.113.0/24" ] && echo 'ecs-set-ipv4-prefix:OK' || echo "ecs-set-ipv4-prefix:FAIL [$val]"
+sb_check_token 'ecs-set-ipv4-singbox-check'
+
+reset_settings
+UCI_settings_dns_client_subnet="198.51.100.7"
+build_dns_config
+val=$(printf '%s' "$config" | jq -r '.dns.client_subnet // "MISSING"')
+[ "$val" = "198.51.100.7" ] && echo 'ecs-set-bare-address:OK' || echo "ecs-set-bare-address:FAIL [$val]"
+
+reset_settings
+UCI_settings_dns_client_subnet="2001:db8::/32"
+build_dns_config
+val=$(printf '%s' "$config" | jq -r '.dns.client_subnet // "MISSING"')
+[ "$val" = "2001:db8::/32" ] && echo 'ecs-set-ipv6-prefix:OK' || echo "ecs-set-ipv6-prefix:FAIL [$val]"
+sb_check_token 'ecs-set-ipv6-singbox-check'
+
+# The new field must not disturb the rest of the DNS section.
+set_servers=$(printf '%s' "$config" | jq -cS '.dns.servers')
+[ "$absent_servers" = "$set_servers" ] && echo 'ecs-servers-unchanged:OK' || echo 'ecs-servers-unchanged:FAIL'
+
+# ══ 3. Invalid values: skipped + warned, config stays valid ═════════════════
+bad_skipped=""
+bad_unwarned=""
+bad_invalid=""
+for bad in 'garbage' '1.2.3.4/33' '1234' '1.2.3.4.' '999.1.1.1' '1.2.3.0/024' '1.2.3.4/' '1.2.3.4 '; do
+    reset_settings
+    UCI_settings_dns_client_subnet="$bad"
+    build_dns_config
+    printf '%s' "$config" | jq -e '.dns | has("client_subnet") | not' > /dev/null 2>&1 ||
+        bad_skipped="$bad_skipped [$bad]"
+    case "$LOG_LINES" in
+    *warn*) ;;
+    *) bad_unwarned="$bad_unwarned [$bad]" ;;
+    esac
+    if [ "$ECS_SB" -eq 1 ] && ! config_passes_sing_box_check; then
+        bad_invalid="$bad_invalid [$bad]"
+    fi
+done
+[ -z "$bad_skipped" ] && echo 'ecs-invalid-skipped:OK' || echo "ecs-invalid-skipped:FAIL$bad_skipped"
+[ -z "$bad_unwarned" ] && echo 'ecs-invalid-warned:OK' || echo "ecs-invalid-warned:FAIL$bad_unwarned"
+if [ "$ECS_SB" -eq 1 ]; then
+    [ -z "$bad_invalid" ] && echo 'ecs-invalid-keeps-config-valid:OK' || echo "ecs-invalid-keeps-config-valid:FAIL$bad_invalid"
+else
+    echo 'ecs-invalid-keeps-config-valid:SKIP'
+fi
+
+# ══ 4. Manager primitive ════════════════════════════════════════════════════
+prim=$(sing_box_cm_set_dns_client_subnet '{"dns":{"servers":[]}}' "203.0.113.0/24")
+prim_val=$(printf '%s' "$prim" | jq -r '.dns.client_subnet // "MISSING"')
+[ "$prim_val" = "203.0.113.0/24" ] && echo 'ecs-cm-set-field:OK' || echo "ecs-cm-set-field:FAIL [$prim_val]"
+
+# ══ 5. Validator matrix, cross-checked against sing-box itself ══════════════
+# sing-box parses the value with netip.ParsePrefix (falling back to
+# netip.ParseAddr for a bare address); a value it rejects invalidates the WHOLE
+# config, so the shell validator must agree with it exactly.
+matrix_bad=""
+sb_bad=""
+while IFS='|' read -r expect value; do
+    [ -n "$expect" ] || continue
+    if is_ip_or_ip_prefix "$value"; then got="accept"; else got="reject"; fi
+    [ "$got" = "$expect" ] || matrix_bad="$matrix_bad [$value:expected $expect got $got]"
+    if [ "$ECS_SB" -eq 1 ]; then
+        printf '{"dns":{"client_subnet":"%s"}}' "$value" > /tmp/ecs-matrix.json
+        if sing-box -c /tmp/ecs-matrix.json check > /dev/null 2>&1; then sb="accept"; else sb="reject"; fi
+        [ "$sb" = "$expect" ] || sb_bad="$sb_bad [$value:sing-box says $sb]"
+    fi
+done << 'MATRIX'
+accept|203.0.113.0/24
+accept|203.0.113.0
+accept|0.0.0.0/0
+accept|255.255.255.255/32
+accept|198.51.100.7
+accept|2001:db8::/32
+accept|2001:db8::
+accept|::/0
+accept|::
+accept|::1
+accept|::ffff:198.51.100.0/120
+accept|::ffff:198.51.100.7
+accept|2001:db8:3:4::192.0.2.33
+accept|2001:db8::1.2.3.4
+accept|1:2:3:4:5:6:1.2.3.4
+accept|1:2:3:4:5:6:7:8
+accept|1::8
+accept|fe80::1
+reject|garbage
+reject|1.2.3
+reject|1.2.3.4/33
+reject|1.2.3.4/024
+reject|1234
+reject|1.2.3.4.
+reject|999.1.1.1
+reject|01.2.3.4
+reject|1.2.3.4:80
+reject|1.2.3.4/
+reject|1.2.3.4/24/32
+reject|1.2.3.4/+24
+reject|1.2.3.4/99999999999999999999
+reject|1.2.3.4/1e1
+reject|1::2::3
+reject|1:2:3:4:5:6:7:8:9
+reject|1:2:3:4:5:6:7::1.2.3.4
+reject|2001:db8::/129
+reject|2001:db8::g
+reject|1.2.3.4%eth0
+reject|203.0.113.0/ 24
+MATRIX
+[ -z "$matrix_bad" ] && echo 'ecs-validator-matrix:OK' || echo "ecs-validator-matrix:FAIL$matrix_bad"
+if [ "$ECS_SB" -eq 1 ]; then
+    [ -z "$sb_bad" ] && echo 'ecs-validator-matches-singbox:OK' || echo "ecs-validator-matches-singbox:FAIL$sb_bad"
+else
+    echo 'ecs-validator-matches-singbox:SKIP'
+fi
+
+echo 'DONE'
+ECSEOF
+    sed -i "s|NETSHIFT_LIB|$lib|g; s|BIN_PATH|$bin|g" "$drv"
+
+    # Consume in the CURRENT shell (while read < file — NO pipe) so pass/fail/
+    # skip mutate the real counters and gate the suite. FAIL/SKIP tokens may
+    # carry a trailing " [diagnostic]" suffix, hence the trailing globs (a bare
+    # "*:FAIL)" would silently drop them and the failure would not gate).
+    local ecs_out="/tmp/netshift-ecssubnet-out-$$.log"
+    ash "$drv" > "$ecs_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            *:FAIL*) fail "$line" ;;
+            *:SKIP*) skip "$line" ;;
+            *:OK) pass "$line" ;;
+            DONE) saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$ecs_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "ecssubnet-driver-completed:OK"
+    else
+        fail "ecssubnet-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$drv" "$ecs_out"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: scalar `option subscription_url` read-fallback + option->list migration
 # (task-048)
 # ─────────────────────────────────────────────────────────────────
@@ -9975,6 +10267,7 @@ main() {
             test_jobstate
             test_selfheal
             test_dns_via_outbound
+            test_dns_client_subnet
             test_sub_url_option
             test_sub_cron
             test_global_proxy
@@ -10010,6 +10303,7 @@ main() {
         jobstate)    test_jobstate ;;
         selfheal)    test_selfheal ;;
         dnsdetour)   test_dns_via_outbound ;;
+        ecssubnet)   test_dns_client_subnet ;;
         suburlopt)   test_sub_url_option ;;
         subcron)     test_sub_cron ;;
         globalproxy) test_global_proxy ;;
@@ -10029,7 +10323,7 @@ main() {
         proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt subcron globalproxy stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour ecssubnet suburlopt subcron globalproxy stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac

@@ -17,6 +17,64 @@ is_ipv4_ip_or_ipv4_cidr() {
     is_ipv4 "$1" || is_ipv4_cidr "$1"
 }
 
+# Check if string is a valid IPv6 address: the full form, the compressed `::`
+# form, IPv4-embedded (2001:db8::192.0.2.33) and IPv4-mapped (::ffff:1.2.3.4)
+# forms. Zone indices (fe80::1%eth0) are deliberately not supported: they are
+# meaningless in an ECS prefix, and such a value is skipped with a warning
+# rather than reaching the config.
+is_ipv6() {
+    local ip="$1"
+    local regex='^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|::(ffff(:0{1,4})?:)?((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])|([0-9a-fA-F]{1,4}:){1,6}:((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])|([0-9a-fA-F]{1,4}:){5,6}((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])\.){3}(25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9]))$'
+    echo "$ip" | grep -Eq "$regex"
+}
+
+# Check if string is an IP address or an IP prefix, e.g. '203.0.113.0/24' or
+# '2001:db8::/32'. A bare address is accepted, because sing-box appends /32 or
+# /128 to it. The prefix length must be canonical decimal (digits only, no
+# leading zeros) — that is what sing-box' netip.ParsePrefix requires, and a
+# value it rejects makes it reject the WHOLE configuration, so it must be
+# filtered out before the value reaches the config. IPv4 is matched with a
+# strict regex rather than is_ipv4(), which also accepts '1234' and '1.2.3.4.'
+# (both of which sing-box refuses).
+is_ip_or_ip_prefix() {
+    local value="$1"
+    local address prefix max_prefix
+    local ipv4_regex='^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'
+
+    case "$value" in
+    */*)
+        # Exactly one '/' separator.
+        case "${value#*/}" in
+        */*) return 1 ;;
+        esac
+        address="${value%%/*}"
+        prefix="${value##*/}"
+        case "$prefix" in
+        '' | *[!0-9]*) return 1 ;;
+        0) ;;
+        0*) return 1 ;;
+        esac
+        [ "${#prefix}" -le 3 ] || return 1
+        ;;
+    *)
+        address="$value"
+        prefix=""
+        ;;
+    esac
+
+    if echo "$address" | grep -Eq "$ipv4_regex"; then
+        max_prefix=32
+    elif is_ipv6 "$address"; then
+        max_prefix=128
+    else
+        return 1
+    fi
+
+    [ -z "$prefix" ] && return 0
+
+    [ "$prefix" -le "$max_prefix" ]
+}
+
 is_domain() {
     local str="$1"
     local regex='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$'

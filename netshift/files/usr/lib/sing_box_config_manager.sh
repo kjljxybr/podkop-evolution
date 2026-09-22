@@ -81,6 +81,33 @@ sing_box_cm_configure_dns() {
 }
 
 #######################################
+# Set the EDNS Client Subnet (ECS, RFC 7871) of the DNS section of a sing-box
+# JSON configuration. The value is an IP address or IP prefix that sing-box
+# appends as an edns0-subnet OPT record to every DNS query (a bare address gets
+# /32 or /128 appended), so geo-distributed services resolve to the node
+# closest to the client. It is a single top-level DNS field, which sing-box
+# applies to every server unless a server overrides it.
+# Callers MUST validate the value and only call this for a non-empty option: an
+# absent/empty option must leave the DNS section untouched, and sing-box
+# rejects the whole configuration for a malformed prefix.
+# Arguments:
+#   config: string (JSON), sing-box configuration to modify
+#   client_subnet: string, IP address or IP prefix, e.g. 203.0.113.0/24
+# Outputs:
+#   Writes updated JSON configuration to stdout
+# Example:
+#   CONFIG=$(sing_box_cm_set_dns_client_subnet "$CONFIG" "203.0.113.0/24")
+#######################################
+sing_box_cm_set_dns_client_subnet() {
+    local config="$1"
+    local client_subnet="$2"
+
+    echo "$config" | jq \
+        --arg client_subnet "$client_subnet" \
+        '.dns.client_subnet = $client_subnet'
+}
+
+#######################################
 # Add a UDP DNS server to the DNS section of a sing-box JSON configuration.
 # Arguments:
 #   config: string (JSON), sing-box configuration to modify
