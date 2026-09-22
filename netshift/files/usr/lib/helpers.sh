@@ -121,10 +121,31 @@ comma_string_to_json_array() {
     echo "[\"$replaced\"]"
 }
 
-# Decodes a URL-encoded string
-url_decode() {
+# Decodes the '%XX' escapes of a single, already-split URI component.
+# A '%' NOT followed by two hex digits is data and is left untouched (a blind
+# 's/%/\\x/g' would turn it into garbage), and a literal backslash is doubled so
+# printf cannot read it as an escape sequence of its own.
+_url_percent_decode() {
     local encoded="$1"
-    printf '%b' "$(echo "$encoded" | sed 's/+/ /g; s/%/\\x/g')"
+
+    printf '%b' "$(printf '%s' "$encoded" | sed 's/\\/\\\\/g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+}
+
+# Decodes a URL-encoded string using application/x-www-form-urlencoded rules,
+# where '+' means a space (the convention proxy clients use for query values).
+url_decode() {
+    _url_percent_decode "$(printf '%s' "$1" | sed 's/+/ /g')"
+}
+
+# Decodes a single URI component (RFC 3986 percent-encoding). Unlike url_decode,
+# a literal '+' is PRESERVED: in a URI userinfo/password '+' is data, not a
+# space, so rewriting it would corrupt the credentials.
+# The caller MUST split the link into components first and decode them one by
+# one — decoding a whole link turns an escaped '%40'/'%23' inside a password
+# into a structural '@'/'#', which splits the link in the wrong place or cuts
+# off everything after the '#'.
+url_decode_component() {
+    _url_percent_decode "$1"
 }
 
 # Returns the scheme (protocol) part of a URL
@@ -175,7 +196,10 @@ url_get_path() {
     echo "$url" | sed -n -e 's#^[^:/?]*://##' -e 's#^[^/]*##' -e 's#\([^?]*\).*#\1#p'
 }
 
-# Extracts the value of a specific query parameter from a URL
+# Extracts the value of a specific query parameter from a URL.
+# The caller passes the RAW (still encoded) link: the value is decoded HERE,
+# once its boundaries are known, so an escaped '&' or '#' inside a value can no
+# longer be mistaken for a delimiter and truncate it.
 url_get_query_param() {
     local url="$1"
     local param="$2"
@@ -185,7 +209,7 @@ url_get_query_param() {
 
     [ -z "$raw" ] && echo "" && return
 
-    echo "$raw"
+    url_decode "$raw"
 }
 
 # Extracts the basename (filename without extension) from a URL

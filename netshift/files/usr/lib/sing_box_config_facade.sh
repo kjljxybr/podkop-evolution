@@ -62,27 +62,41 @@ sing_box_cf_add_proxy_outbound() {
     local url="$3"
     local udp_over_tcp="$4"
 
-    # Keep the RAW (pre-url_decode) link for schemes that base64-decode the
-    # WHOLE payload (vmess). url_decode rewrites '+'->space, which corrupts
-    # standard base64 bodies (the '+' is in the base64 alphabet). See the
-    # vmess) case below.
+    # The link is parsed as a URI FIRST and only the individual components are
+    # decoded, each one after it has been split off the RAW link. Decoding the
+    # whole link up front (as this used to) turned an escaped '%40'/'%23' inside
+    # a password into a structural '@'/'#' — splitting the link at the wrong
+    # place or dropping the fragment and everything after it — and rewrote a
+    # literal '+' into a space. Query values are decoded by
+    # url_get_query_param(), which is handed this raw link.
+    #
+    # The RAW link is also what schemes that base64-decode the WHOLE payload
+    # (vmess) need: '+' is in the base64 alphabet and must survive verbatim.
     local raw_url="$3"
 
-    url=$(url_decode "$url")
-    url=$(url_strip_fragment "$url")
+    url=$(url_strip_fragment "$raw_url")
 
     local scheme
     scheme="$(url_get_scheme "$url")"
+
+    # Components of the raw link, percent-decoded once here (see
+    # url_decode_component). url_get_userinfo() returns the password for
+    # trojan/hysteria2, the uuid for vless and 'user:pass' for socks.
+    local url_host url_port url_userinfo
+    url_host=$(url_decode_component "$(url_get_host "$url")")
+    url_port=$(url_decode_component "$(url_get_port "$url")")
+    url_userinfo=$(url_decode_component "$(url_get_userinfo "$url")")
+
     case "$scheme" in
     socks4 | socks4a | socks5)
         local tag host port version userinfo username password udp_over_tcp
 
         tag=$(get_outbound_tag_by_section "$section")
-        host=$(url_get_host "$url")
-        port=$(url_get_port "$url")
+        host="$url_host"
+        port="$url_port"
         version="${scheme#socks}"
         if [ "$scheme" = "socks5" ]; then
-            userinfo=$(url_get_userinfo "$url")
+            userinfo="$url_userinfo"
             if [ -n "$userinfo" ]; then
                 username="${userinfo%%:*}"
                 password="${userinfo#*:}"
@@ -103,9 +117,9 @@ sing_box_cf_add_proxy_outbound() {
     vless)
         local tag host port uuid flow packet_encoding
         tag=$(get_outbound_tag_by_section "$section")
-        host=$(url_get_host "$url")
-        port=$(url_get_port "$url")
-        uuid=$(url_get_userinfo "$url")
+        host="$url_host"
+        port="$url_port"
+        uuid="$url_userinfo"
         flow=$(url_get_query_param "$url" "flow")
         packet_encoding=$(url_get_query_param "$url" "packetEncoding")
 
@@ -116,7 +130,7 @@ sing_box_cf_add_proxy_outbound() {
     ss)
         local userinfo tag host port method password udp_over_tcp
 
-        userinfo=$(url_get_userinfo "$url")
+        userinfo="$url_userinfo"
         if ! is_shadowsocks_userinfo_format "$userinfo"; then
             userinfo=$(base64_decode "$userinfo")
             if [ $? -ne 0 ]; then
@@ -126,8 +140,8 @@ sing_box_cf_add_proxy_outbound() {
         fi
 
         tag=$(get_outbound_tag_by_section "$section")
-        host=$(url_get_host "$url")
-        port=$(url_get_port "$url")
+        host="$url_host"
+        port="$url_port"
         method="${userinfo%%:*}"
         password="${userinfo#*:}"
 
@@ -146,9 +160,9 @@ sing_box_cf_add_proxy_outbound() {
     trojan)
         local tag host port password
         tag=$(get_outbound_tag_by_section "$section")
-        host=$(url_get_host "$url")
-        port=$(url_get_port "$url")
-        password=$(url_get_userinfo "$url")
+        host="$url_host"
+        port="$url_port"
+        password="$url_userinfo"
 
         config=$(sing_box_cm_add_trojan_outbound "$config" "$tag" "$host" "$port" "$password")
         config=$(_add_outbound_security "$config" "$tag" "$url")
@@ -157,9 +171,9 @@ sing_box_cf_add_proxy_outbound() {
     hysteria2 | hy2)
         local tag host port password obfuscator_type obfuscator_password upload_mbps download_mbps
         tag=$(get_outbound_tag_by_section "$section")
-        host=$(url_get_host "$url")
-        port="$(url_get_port "$url")"
-        password=$(url_get_userinfo "$url")
+        host="$url_host"
+        port="$url_port"
+        password="$url_userinfo"
         obfuscator_type=$(url_get_query_param "$url" "obfs")
         obfuscator_password=$(url_get_query_param "$url" "obfs-password")
         upload_mbps=$(url_get_query_param "$url" "upmbps")
@@ -201,8 +215,9 @@ sing_box_cf_add_proxy_outbound() {
         # (vmess://<uuid>@<host>:<port>?...) is a phase-2 follow-on; not handled here.
         #
         # CRITICAL: VMess base64-decodes the WHOLE payload, so it MUST use the
-        # RAW pre-url_decode link ($raw_url, NOT $url). url_decode rewrites
-        # '+'->space, which would corrupt standard base64 bodies containing '+'.
+        # RAW link ($raw_url, NOT the component-decoded $url): percent-decoding
+        # the payload would corrupt base64 bodies containing '+' (url_decode
+        # rewrites '+'->space, and '+' is in the base64 alphabet).
         # Future Tier-1 copiers (tuic/etc.) that base64-decode a whole payload
         # MUST also use $raw_url for the same reason.
         vmess_json=$(vmess_link_to_json "$raw_url")
