@@ -7649,6 +7649,437 @@ DRVEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: sing-box-extended asset selection on 32-bit ARM (issue #37)
+# ─────────────────────────────────────────────────────────────────
+# Sources the REAL updater.sh and drives the REAL
+# updates_resolve_sing_box_extended_arch_suffix / updates_extended_asset_url /
+# updates_extract_sing_box_binary / _updates_install_sing_box_extended_core, with
+# the /proc/cpuinfo "Features" line, DISTRIB_ARCH and the
+# sing_box_extended_arm_build option injected per case.
+#
+# The bug (issue #37): every generic ARM asset of sing-box-extended needs
+# floating point HARDWARE — "armv7" is GOARM=7 (VFPv3) and even "armv6" is
+# GOARM=6 (VFPv1/VFPv2, runtime.checkgoarm exits without HWCAP_VFP). On a CPU
+# with no FPU at all — Broadcom BCM5301X / Asus RT-AC88U, /proc/cpuinfo
+# "half thumb fastmult edsp tls" — the downloaded binary cannot run ("Illegal
+# instruction"). Only the OpenWrt package build for that target (GOARM=5,
+# software floating point) works, so the no-FPU case must select that asset.
+#
+# The end-to-end cases run the real installer with only the network download
+# faked: the fake artifacts' binary prints which asset was fetched, so the
+# assertions cover what actually lands in /usr/bin/sing-box — including the
+# nested unpacking of an OpenWrt .ipk (tar.gz -> data.tar.gz -> ./usr/bin/sing-box).
+test_sing_box_extended_arm_arch() {
+    header "sing-box-extended ARM asset selection (issue #37)"
+
+    local updater="${NETSHIFT_LIB_DIR}/updater.sh"
+    if [ ! -r "$updater" ]; then
+        skip "updater.sh not found in ${NETSHIFT_LIB_DIR}"
+        return
+    fi
+
+    local work="/tmp/netshift-sbextarch-$$"
+    local out="$work/out.txt"
+    local drv="$work/driver.sh"
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    # The end-to-end cases replace /usr/bin/sing-box — the very path the real
+    # installer swaps. Keep the container's real core to restore afterwards.
+    if [ -e /usr/bin/sing-box ]; then
+        cp -p /usr/bin/sing-box "$work/sing-box.orig" 2>/dev/null || true
+    fi
+
+    cat > "$drv" << 'DRVEOF'
+#!/bin/sh
+log() { :; }
+echolog() { :; }
+nolog() { :; }
+
+LIB_DIR="DRV_LIB_DIR"
+. "$LIB_DIR/updater.sh"
+
+# ── injection points ────────────────────────────────────────────────
+CASE_FEATURES=""
+CASE_ARM_BUILD=""
+CASE_UNAME="armv7l"
+CASE_OPTION_PRESENT=0
+CASE_DISTRIB_ARCH="arm_cortex-a9"
+
+uname() { printf '%s\n' "$CASE_UNAME"; }
+updates_read_cpu_features() { printf '%s' "$CASE_FEATURES"; }
+updates_read_openwrt_release_value() { printf '%s' "$CASE_DISTRIB_ARCH"; }
+config_get() {
+    # config_get <var> <section> <option> [default]
+    if [ "$CASE_OPTION_PRESENT" = "1" ]; then
+        eval "$1=\"\$CASE_ARM_BUILD\""
+    else
+        eval "$1=\"\${4:-}\""
+    fi
+    return 0
+}
+updates_system_uses_musl() { return 0; }
+
+RELEASES='[{"tag_name":"v1.14.1-extended-2.7.2","draft":false,"prerelease":false,"assets":[
+ {"name":"sing-box-1.14.1-extended-2.7.2-linux-armv6.tar.gz","browser_download_url":"https://example.invalid/armv6.tar.gz"},
+ {"name":"sing-box-1.14.1-extended-2.7.2-linux-armv7-musl.tar.gz","browser_download_url":"https://example.invalid/armv7-musl.tar.gz"},
+ {"name":"sing-box-1.14.1-extended-2.7.2-linux-armv7.tar.gz","browser_download_url":"https://example.invalid/armv7.tar.gz"},
+ {"name":"sing-box-1.14.1-extended-2.7.2-linux-arm64-musl.tar.gz","browser_download_url":"https://example.invalid/arm64-musl.tar.gz"},
+ {"name":"sing-box-extended_1.14.1-extended-2.7.2_openwrt_arm_cortex-a9.ipk","browser_download_url":"https://example.invalid/openwrt_arm_cortex-a9.ipk"},
+ {"name":"sing-box-extended_1.14.1-extended-2.7.2_openwrt_arm_cortex-a9.apk","browser_download_url":"https://example.invalid/openwrt_arm_cortex-a9.apk"}]}]'
+
+# Real RT-AC88U (Broadcom BCM5301X, Cortex-A9 without any FPU) feature line.
+FEAT_NO_VFP="half thumb fastmult edsp tls"
+# A modern ARMv7 (e.g. Cortex-A7) feature line.
+FEAT_VFPV3="half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt"
+# Cortex-A9 with the 16 double-register VFPv3 subset (OpenWrt arm_cortex-a9).
+FEAT_VFPV3D16="half thumb fastmult vfp edsp vfpv3d16 tls"
+# ARMv6-style VFPv2 only (VFP but no VFPv3).
+FEAT_VFP2="half thumb fastmult vfp edsp tls"
+
+REL="$(updates_extended_release_object "$RELEASES" "v1.14.1-extended-2.7.2")"
+
+report() { # <token-name> <expected> <got>
+    if [ "$2" = "$3" ]; then
+        echo "$1:OK"
+    else
+        echo "$1:FAIL (expected '$2', got '$3')"
+    fi
+}
+
+resolve_case() { # <name> <expected-suffix> <expected-kind> <expected-rc>
+    SB_EXT_ARCH_SUFFIX=""
+    SB_EXT_ASSET_KIND=""
+    SB_EXT_ARCH_ERROR=""
+    updates_resolve_sing_box_extended_arch_suffix
+    rc=$?
+    report "$1" "$2/$3/$4" "$SB_EXT_ARCH_SUFFIX/$SB_EXT_ASSET_KIND/$rc"
+}
+
+url_case() { # <name> <expected-url>
+    report "$1" "$2" "$(updates_extended_asset_url "$REL")"
+}
+
+# ── Case 1: modern ARMv7 (VFPv3) keeps the armv7 tarball (unchanged) ──
+CASE_UNAME=armv7l
+CASE_FEATURES="$FEAT_VFPV3"
+CASE_OPTION_PRESENT=0
+resolve_case "sbext-armv7-vfpv3-uses-armv7-tarball" armv7 tarball 0
+url_case "sbext-armv7-vfpv3-asset-url" "https://example.invalid/armv7-musl.tar.gz"
+
+# ── Case 2: THE BUG — a CPU with no FPU must NOT get a generic ARM build ──
+# The armv7 asset dies with SIGILL there and the armv6 asset cannot run either,
+# so the OpenWrt package built for this target (GOARM=5) is the only usable one.
+CASE_FEATURES="$FEAT_NO_VFP"
+resolve_case "sbext-armv7-no-fpu-uses-openwrt-package" arm_cortex-a9 openwrt-package 0
+url_case "sbext-armv7-no-fpu-asset-url" "https://example.invalid/openwrt_arm_cortex-a9.ipk"
+
+# ── Case 2b: VFPv3-D16 (Cortex-A9 subset) still runs the armv7 build ──
+CASE_FEATURES="$FEAT_VFPV3D16"
+resolve_case "sbext-armv7-vfpv3d16-uses-armv7-tarball" armv7 tarball 0
+
+# ── Case 2c: plain VFP (VFPv2 only) cannot run VFPv3 code -> armv6 ──
+CASE_FEATURES="$FEAT_VFP2"
+resolve_case "sbext-armv7-vfpv2-uses-armv6-tarball" armv6 tarball 0
+url_case "sbext-armv7-vfpv2-asset-url" "https://example.invalid/armv6.tar.gz"
+
+# ── Case 3: unreadable features (unknown CPU) keeps the armv7 tarball ──
+# Upgrade safety: a router whose /proc/cpuinfo exposes no Features line must
+# behave exactly as it did before this check existed.
+CASE_FEATURES=""
+resolve_case "sbext-armv7-no-features-keeps-armv7" armv7 tarball 0
+url_case "sbext-armv7-no-features-asset-url" "https://example.invalid/armv7-musl.tar.gz"
+
+# ── Case 3b: no FPU and no DISTRIB_ARCH -> refuse, never a broken build ──
+CASE_FEATURES="$FEAT_NO_VFP"
+CASE_DISTRIB_ARCH=""
+SB_EXT_ARCH_SUFFIX=""
+SB_EXT_ASSET_KIND=""
+SB_EXT_ARCH_ERROR=""
+updates_resolve_sing_box_extended_arch_suffix
+rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$SB_EXT_ARCH_SUFFIX" ] && [ -n "$SB_EXT_ARCH_ERROR" ]; then
+    echo "sbext-no-fpu-no-distrib-arch-refuses:OK"
+else
+    echo "sbext-no-fpu-no-distrib-arch-refuses:FAIL (rc=$rc suffix='$SB_EXT_ARCH_SUFFIX' error='$SB_EXT_ARCH_ERROR')"
+fi
+CASE_DISTRIB_ARCH="arm_cortex-a9"
+
+# ── Case 4: option present but empty / unknown value -> auto detection ──
+CASE_OPTION_PRESENT=1
+CASE_ARM_BUILD=""
+resolve_case "sbext-option-empty-falls-back-to-auto" arm_cortex-a9 openwrt-package 0
+CASE_ARM_BUILD="banana"
+resolve_case "sbext-option-unknown-falls-back-to-auto" arm_cortex-a9 openwrt-package 0
+
+# ── Case 5: explicit overrides ──
+CASE_ARM_BUILD="armv6"
+CASE_FEATURES="$FEAT_VFPV3"
+resolve_case "sbext-option-armv6-forces-armv6" armv6 tarball 0
+CASE_ARM_BUILD="armv7"
+CASE_FEATURES="$FEAT_NO_VFP"
+resolve_case "sbext-option-armv7-forces-armv7" armv7 tarball 0
+CASE_ARM_BUILD="openwrt"
+CASE_FEATURES="$FEAT_VFPV3"
+resolve_case "sbext-option-openwrt-forces-package" arm_cortex-a9 openwrt-package 0
+
+# ── Case 6: other architectures unchanged ──
+CASE_OPTION_PRESENT=0
+CASE_UNAME=aarch64
+CASE_FEATURES="$FEAT_VFPV3"
+resolve_case "sbext-aarch64-uses-arm64" arm64 tarball 0
+CASE_UNAME=armv6l
+resolve_case "sbext-armv6-host-with-vfp-uses-armv6" armv6 tarball 0
+CASE_FEATURES="$FEAT_NO_VFP"
+resolve_case "sbext-armv6-host-no-fpu-uses-openwrt-package" arm_cortex-a9 openwrt-package 0
+CASE_UNAME=x86_64
+resolve_case "sbext-x86-64-uses-amd64" amd64 tarball 0
+CASE_UNAME=riscv64
+resolve_case "sbext-riscv64-uses-riscv64" riscv64 tarball 0
+
+# ── Case 7: END-TO-END real installs with a fake download ────────────
+CASE_UNAME=armv7l
+updates_fetch_sing_box_extended_releases() { printf '%s' "$RELEASES"; }
+updates_restart_netshift() { :; }
+
+# Builds a fake sing-box-extended .ipk with the real layout: a tar.gz holding
+# control.tar.gz + data.tar.gz + debian-binary, payload at ./usr/bin/sing-box
+# inside data.tar.gz.
+make_fake_ipk() { # <dest> <marker>
+    local dest="$1" marker="$2" d
+    d="$(mktemp -d /tmp/sbext-ipk.XXXXXX)"
+    mkdir -p "$d/data/usr/bin" "$d/control"
+    cat > "$d/data/usr/bin/sing-box" <<EOF
+#!/bin/sh
+echo "sing-box version 1.14.1-extended-2.7.2-$marker"
+EOF
+    chmod 0755 "$d/data/usr/bin/sing-box"
+    ( cd "$d/data" && tar -czf "$d/data.tar.gz" ./usr/bin/sing-box )
+    printf 'Package: sing-box-extended\nArchitecture: arm_cortex-a9\n' > "$d/control/control"
+    ( cd "$d/control" && tar -czf "$d/control.tar.gz" ./control )
+    printf '2.0\n' > "$d/debian-binary"
+    ( cd "$d" && tar -czf "$dest" control.tar.gz data.tar.gz debian-binary )
+    rm -rf "$d"
+}
+
+updates_download_to_file() {
+    local _url="$1"
+    local _dest="$2"
+    local _marker="unknown"
+    local _d
+
+    case "$_url" in
+    *openwrt_arm_cortex-a9.ipk*)
+        make_fake_ipk "$_dest" "openwrt-ipk"
+        return 0
+        ;;
+    esac
+
+    case "$_url" in
+    *armv6*) _marker="armv6" ;;
+    *armv7*) _marker="armv7" ;;
+    *arm64*) _marker="arm64" ;;
+    esac
+    _d="$(mktemp -d /tmp/sbext-fake.XXXXXX)"
+    cat > "$_d/sing-box" <<EOF
+#!/bin/sh
+echo "sing-box version 1.14.1-extended-2.7.2-$_marker"
+EOF
+    chmod 0755 "$_d/sing-box"
+    ( cd "$_d" && tar -czf "$_dest" sing-box )
+    rm -rf "$_d"
+    return 0
+}
+
+# No-FPU CPU: must install the OpenWrt package payload and succeed.
+CASE_FEATURES="$FEAT_NO_VFP"
+CASE_OPTION_PRESENT=0
+json="$(_updates_install_sing_box_extended_core 2>/dev/null)"
+installed="$(LD_LIBRARY_PATH=/usr/lib /usr/bin/sing-box version 2>/dev/null | head -1 | awk '{print $NF}')"
+report "sbext-e2e-no-fpu-installs-openwrt-package" "1.14.1-extended-2.7.2-openwrt-ipk" "$installed"
+if printf '%s' "$json" | grep -q '"success":true'; then
+    echo "sbext-e2e-install-json-success:OK"
+else
+    echo "sbext-e2e-install-json-success:FAIL ($json)"
+fi
+
+# The same install on a VFPv3 CPU must keep using the armv7 tarball.
+CASE_FEATURES="$FEAT_VFPV3"
+json="$(_updates_install_sing_box_extended_core 2>/dev/null)"
+installed="$(LD_LIBRARY_PATH=/usr/lib /usr/bin/sing-box version 2>/dev/null | head -1 | awk '{print $NF}')"
+report "sbext-e2e-vfpv3-installs-armv7-tarball" "1.14.1-extended-2.7.2-armv7" "$installed"
+
+# A VFPv2-only CPU must use the armv6 tarball.
+CASE_FEATURES="$FEAT_VFP2"
+json="$(_updates_install_sing_box_extended_core 2>/dev/null)"
+installed="$(LD_LIBRARY_PATH=/usr/lib /usr/bin/sing-box version 2>/dev/null | head -1 | awk '{print $NF}')"
+report "sbext-e2e-vfpv2-installs-armv6-tarball" "1.14.1-extended-2.7.2-armv6" "$installed"
+
+# A package without a sing-box payload must fail the install AND leave the
+# previously installed core in place (rollback), never an empty /usr/bin/sing-box.
+CASE_FEATURES="$FEAT_NO_VFP"
+updates_download_to_file() {
+    local _dest="$2" _d
+    _d="$(mktemp -d /tmp/sbext-bad.XXXXXX)"
+    mkdir -p "$_d/data/usr/share/doc"
+    printf 'nothing here\n' > "$_d/data/usr/share/doc/readme"
+    ( cd "$_d/data" && tar -czf "$_d/data.tar.gz" ./usr/share/doc/readme )
+    printf '2.0\n' > "$_d/debian-binary"
+    ( cd "$_d" && tar -czf "$_dest" data.tar.gz debian-binary )
+    rm -rf "$_d"
+    return 0
+}
+json="$(_updates_install_sing_box_extended_core 2>/dev/null)"
+installed="$(LD_LIBRARY_PATH=/usr/lib /usr/bin/sing-box version 2>/dev/null | head -1 | awk '{print $NF}')"
+if printf '%s' "$json" | grep -q '"success":false' &&
+    [ "$installed" = "1.14.1-extended-2.7.2-armv6" ]; then
+    echo "sbext-e2e-payload-less-package-fails-cleanly:OK"
+else
+    echo "sbext-e2e-payload-less-package-fails-cleanly:FAIL ($json restored='$installed')"
+fi
+
+echo DONE
+DRVEOF
+    sed -i "s|DRV_LIB_DIR|${NETSHIFT_LIB_DIR}|g" "$drv"
+
+    sh "$drv" > "$out" 2>&1 || true
+
+    # Restore the core the end-to-end cases replaced, whatever happened.
+    if [ -f "$work/sing-box.orig" ]; then
+        cp -p "$work/sing-box.orig" /usr/bin/sing-box 2>/dev/null || true
+    fi
+
+    local line saw_done=0
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "${line%:OK}" ;;
+            *:FAIL*) fail "$line" ;;
+            DONE) saw_done=1 ;;
+        esac
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "sbext-arch-driver-completed"
+    else
+        fail "sbext-arch-driver-completed:FAIL (driver aborted early)" "$(tail -5 "$out" 2>/dev/null)"
+    fi
+
+    # ── Part 2: UPGRADE SIMULATION against real UCI + real config_get ───────
+    # A router upgraded from an older NetShift keeps its own /etc/config/netshift,
+    # so sing_box_extended_arm_build is simply ABSENT there. This part loads a
+    # real UCI config dir (no such option) through the real config_load /
+    # config_get and checks that the resolution still works, that a CPU which
+    # always worked keeps the exact build it got before, and that the no-FPU CPU
+    # gets the OpenWrt package — with no error and no exit either way.
+    if [ ! -r /lib/functions.sh ] || ! command -v uci > /dev/null 2>&1; then
+        skip "real-UCI upgrade simulation (uci/functions.sh unavailable)"
+        rm -rf "$work"
+        return
+    fi
+
+    local uci_dir="$work/uci"
+    local uout="$work/uci-out.txt"
+    local udrv="$work/uci-driver.sh"
+    mkdir -p "$uci_dir"
+    cat > "$uci_dir/netshift" << 'UCICFG'
+config settings 'settings'
+        option dns_type 'udp'
+        option update_interval '1d'
+UCICFG
+
+    cat > "$udrv" << 'UCIDRV'
+#!/bin/sh
+# Real /lib/functions.sh + real config_load/config_get over UCI_CONFIG_DIR.
+log() { :; }
+echolog() { :; }
+nolog() { :; }
+
+. /lib/functions.sh
+. "DRV_LIB_DIR/updater.sh"
+
+CASE_FEATURES=""
+uname() { printf 'armv7l\n'; }
+updates_read_cpu_features() { printf '%s' "$CASE_FEATURES"; }
+updates_read_openwrt_release_value() { printf 'arm_cortex-a9'; }
+
+NO_FPU="half thumb fastmult edsp tls"
+VFPV3="half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt"
+
+resolve() { # <name> <expected-suffix> <expected-kind>
+    SB_EXT_ARCH_SUFFIX=""
+    SB_EXT_ASSET_KIND=""
+    SB_EXT_ARCH_ERROR=""
+    updates_resolve_sing_box_extended_arch_suffix
+    rc=$?
+    if [ "$2" = "$SB_EXT_ARCH_SUFFIX" ] && [ "$3" = "$SB_EXT_ASSET_KIND" ] && [ "$rc" -eq 0 ]; then
+        echo "$1:OK"
+    else
+        echo "$1:FAIL (expected '$2/$3', got '$SB_EXT_ARCH_SUFFIX/$SB_EXT_ASSET_KIND' rc=$rc)"
+    fi
+}
+
+config_load netshift
+
+# Upgrade case: the option does not exist in this config at all. The behaviour
+# on a CPU that always worked must be byte-for-byte the old one (armv7 tarball),
+# and the no-FPU CPU must now get the OpenWrt package.
+CASE_FEATURES="$VFPV3"
+resolve "sbext-upgrade-absent-option-keeps-armv7" armv7 tarball
+CASE_FEATURES="$NO_FPU"
+resolve "sbext-upgrade-absent-option-detects-package" arm_cortex-a9 openwrt-package
+
+# Present-but-unset and present-but-unknown values must fall back to detection.
+uci -c "$UCI_DIR" set netshift.settings.sing_box_extended_arm_build=''
+uci -c "$UCI_DIR" commit netshift > /dev/null 2>&1
+config_load netshift
+resolve "sbext-upgrade-empty-option-detects-package" arm_cortex-a9 openwrt-package
+
+uci -c "$UCI_DIR" set netshift.settings.sing_box_extended_arm_build='banana'
+uci -c "$UCI_DIR" commit netshift > /dev/null 2>&1
+config_load netshift
+resolve "sbext-upgrade-unknown-option-detects-package" arm_cortex-a9 openwrt-package
+
+# Explicit overrides, read through the real UCI stack.
+uci -c "$UCI_DIR" set netshift.settings.sing_box_extended_arm_build='armv7'
+uci -c "$UCI_DIR" commit netshift > /dev/null 2>&1
+config_load netshift
+resolve "sbext-upgrade-option-forces-armv7" armv7 tarball
+
+uci -c "$UCI_DIR" set netshift.settings.sing_box_extended_arm_build='armv6'
+uci -c "$UCI_DIR" commit netshift > /dev/null 2>&1
+config_load netshift
+CASE_FEATURES="$VFPV3"
+resolve "sbext-upgrade-option-forces-armv6" armv6 tarball
+
+uci -c "$UCI_DIR" set netshift.settings.sing_box_extended_arm_build='openwrt'
+uci -c "$UCI_DIR" commit netshift > /dev/null 2>&1
+config_load netshift
+CASE_FEATURES="$VFPV3"
+resolve "sbext-upgrade-option-forces-package" arm_cortex-a9 openwrt-package
+
+echo DONE
+UCIDRV
+    sed -i "s|DRV_LIB_DIR|${NETSHIFT_LIB_DIR}|g" "$udrv"
+
+    UCI_DIR="$uci_dir" UCI_CONFIG_DIR="$uci_dir" sh "$udrv" > "$uout" 2>&1 || true
+
+    saw_done=0
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "${line%:OK}" ;;
+            *:FAIL*) fail "$line" ;;
+            DONE) saw_done=1 ;;
+        esac
+    done < "$uout"
+    if [ "$saw_done" = "1" ]; then
+        pass "sbext-upgrade-driver-completed"
+    else
+        fail "sbext-upgrade-driver-completed:FAIL (driver aborted early)" "$(tail -5 "$uout" 2>/dev/null)"
+    fi
+
+    rm -rf "$work"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: NetShift update check on-demand (task-029)
 # ─────────────────────────────────────────────────────────────────
 # Two parts:
@@ -9549,6 +9980,7 @@ main() {
             test_global_proxy
             test_check_update_stable
             test_check_update_extended
+            test_sing_box_extended_arm_arch
             test_check_update_netshift
             test_netshift_latest_tag
             test_github_redirect_tag
@@ -9583,6 +10015,7 @@ main() {
         globalproxy) test_global_proxy ;;
         stablecheck) test_check_update_stable ;;
         extcheck)    test_check_update_extended ;;
+        sbextarch)   test_sing_box_extended_arm_arch ;;
         netshiftcheck) test_check_update_netshift ;;
         latesttag)   test_netshift_latest_tag ;;
         ghredirect)  test_github_redirect_tag ;;
@@ -9596,7 +10029,7 @@ main() {
         proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt subcron globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt subcron globalproxy stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac
