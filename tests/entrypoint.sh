@@ -1714,6 +1714,10 @@ log() { :; }
 is_domain_suffix() { return 0; }
 is_ipv4() { return 0; }
 is_ipv4_cidr() { return 0; }
+# helpers.sh is not sourced here, so the case-normalization helper the importer
+# now calls (issue #52) is stubbed with its real one-liner body: the chunk test
+# cares about chunk sizes, not about case.
+normalize_domain_case() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
 
 . "RULESETS_LIB"
 
@@ -1796,6 +1800,214 @@ CHUNKEOF
         pass "chunk-driver-completed:OK"
     else
         fail "chunk-driver-completed:FAIL (driver aborted early)"
+    fi
+
+    rm -rf "$work"
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Test: Domain case normalization (issue #52)
+#
+# ROOT CAUSE: the LuCI validators accept [a-zA-Z] in a domain, but the backend
+# is_domain() only matches [a-z0-9]. A user domain typed as "Example.COM" was
+# therefore dropped by parse_domain_or_subnet_file_to_comma_string() with a
+# debug-only log and no rule was ever created, while the UI reported the value
+# as valid.
+#
+# The fix lowercases every user-supplied domain before validation (helpers.sh:
+# normalize_domain_case, used by the user-list parser and by the plain-list
+# importer in rulesets.sh), so the stored rule is always "example.com".
+#
+# This test drives the SHIPPED code — parse_domain_or_subnet_string_to_commas_
+# string, the awk-extracted configure_user_domain_list and import_plain_domain_
+# list_to_local_source_ruleset_chunked — with the REAL jq ruleset patcher, for
+# BOTH input modes (dynamic list / text list) and for a plain list file, and
+# asserts the mixed-case domain survives as lowercase while invalid entries
+# ("example.com/path", "exa!mple.com") are still dropped.
+#
+# UPGRADE SIMULATION: the driver's config_get stub carries ONLY the pre-existing
+# UCI keys (no new option exists for this fix), i.e. exactly what an upgraded
+# router has in /etc/config/netshift. Scenario 4 runs with the domain option
+# absent altogether, and every produced source ruleset is fed to a real
+# `sing-box check` — an upgraded config still builds a valid sing-box config.
+# ─────────────────────────────────────────────────────────────────
+test_domain_case() {
+    header "Domain case normalization (issue #52)"
+
+    if ! command -v sing-box > /dev/null 2>&1 || ! command -v jq > /dev/null 2>&1; then
+        skip "sing-box / jq not installed"
+        return
+    fi
+
+    local lib="${NETSHIFT_LIB_DIR}"
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    if [ ! -r "$lib/helpers.sh" ] || [ ! -r "$lib/rulesets.sh" ] || [ ! -r "$bin" ]; then
+        fail "helpers.sh / rulesets.sh / bin not found"
+        return
+    fi
+
+    local work="/tmp/netshift-domcase-$$"
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    local drv="$work/driver.sh"
+    cat > "$drv" << 'DOMCASEEOF'
+HELPERS_LIB="HELPERS_PATH"
+RULESETS_LIB="RULESETS_PATH"
+BIN_PATH="BIN_PATH_PLACEHOLDER"
+LOGFILE="WORK_PATH/domcase.log"
+RULESET_DIR="WORK_PATH/rulesets"
+
+rm -rf "$RULESET_DIR"
+mkdir -p "$RULESET_DIR"
+
+. "$HELPERS_LIB"
+. "$RULESETS_LIB"
+
+: > "$LOGFILE"
+log() { printf '%s|%s\n' "${2:-info}" "$1" >> "$LOGFILE"; }
+
+# awk-extract the SHIPPED user-domain ruleset builder verbatim.
+eval "$(awk '/^configure_user_domain_list\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "$BIN_PATH")"
+
+# Real source-ruleset creation + real jq patcher (from rulesets.sh); only the
+# bin-side wrapper that resolves the ruleset path and registers the rule_set in
+# the sing-box config is stubbed (it is not what this test is about).
+prepare_source_ruleset() {
+    ruleset_filepath="$RULESET_DIR/$1-$2-$3.json"
+    rm -f "$ruleset_filepath"
+    create_source_rule_set "$ruleset_filepath"
+}
+
+# Table-driven stand-in for LuCI's config_get. Only the UCI keys an already
+# released config carries are set: no option is added by this fix, so an
+# upgraded router has exactly this shape.
+config_get() {
+    local _k _v
+    _k="$(printf 'CFG_%s_%s' "$2" "$3" | tr -c 'a-zA-Z0-9_' '_')"
+    eval "_v=\"\${$_k:-}\""
+    [ -n "$_v" ] || _v="$4"
+    eval "$1=\"\$_v\""
+    return 0
+}
+
+domains_of() {
+    jq -r '[.rules[]? | .domain_suffix[]?] | unique | join(",")' "$1" 2>/dev/null
+}
+
+has_domain() {
+    jq -e --arg d "$2" '[.rules[]? | .domain_suffix[]?] | index($d) != null' "$1" > /dev/null 2>&1
+}
+
+all_lowercase() {
+    jq -e 'all(.rules[]? | .domain_suffix[]?; . == (ascii_downcase))' "$1" > /dev/null 2>&1
+}
+
+# Diagnostics go on their own DIAG-prefixed lines: the consumer only counts
+# lines ENDING in :OK / :FAIL, so a "label:FAIL (detail)" line would be ignored
+# and could not gate the suite.
+expect_domains() {
+    if [ "$1" = "$2" ]; then
+        echo "$3:OK"
+    else
+        echo "$3:FAIL"
+        echo "DIAG $3 got=[$1] want=[$2]"
+    fi
+}
+
+make_config() {
+    jq -n --arg path "$1" '{
+        log: { level: "error" },
+        dns: { servers: [ { tag: "dns-server", type: "udp", server: "1.1.1.1" } ], final: "dns-server" },
+        inbounds: [ { type: "tproxy", tag: "tproxy-in", listen: "127.0.0.1", listen_port: 1602 } ],
+        outbounds: [ { type: "direct", tag: "direct-out" } ],
+        route: {
+            rule_set: [ { tag: "user-domains", type: "local", format: "source", path: $path } ],
+            rules: [ { rule_set: ["user-domains"], outbound: "direct-out" } ],
+            final: "direct-out"
+        }
+    }' > "$2" 2>/dev/null
+}
+
+check_sing_box() {
+    local cfg="$RULESET_DIR/$1.json"
+    make_config "$2" "$cfg"
+    if sing-box -c "$cfg" check > /dev/null 2>&1; then
+        echo "$1:OK"
+    else
+        echo "$1:FAIL"
+        sing-box -c "$cfg" check 2>&1 | head -3 | sed 's/^/DIAG /'
+    fi
+    rm -f "$cfg"
+}
+
+# ── Scenario 1: dynamic list mode ───────────────────────────────────────────
+CFG_s1_user_domain_list_type="dynamic"
+CFG_s1_user_domains="Example.COM Sub.Example.ORG example.com/path exa!mple.com example.com"
+configure_user_domain_list "s1" "route-rule-s1"
+rs1="$RULESET_DIR/s1-user-domains.json"
+
+expect_domains "$(domains_of "$rs1")" "example.com,sub.example.org" 'domcase-dynamic-domains'
+has_domain "$rs1" "Example.COM" && echo 'domcase-dynamic-uppercase-absent:FAIL' || echo 'domcase-dynamic-uppercase-absent:OK'
+has_domain "$rs1" "example.com/path" && echo 'domcase-dynamic-path-absent:FAIL' || echo 'domcase-dynamic-path-absent:OK'
+has_domain "$rs1" "exa!mple.com" && echo 'domcase-dynamic-invalid-absent:FAIL' || echo 'domcase-dynamic-invalid-absent:OK'
+all_lowercase "$rs1" && echo 'domcase-dynamic-all-lowercase:OK' || echo 'domcase-dynamic-all-lowercase:FAIL'
+grep -q "example.com/path' is not a valid domain" "$LOGFILE" && echo 'domcase-dynamic-path-logged:OK' || echo 'domcase-dynamic-path-logged:FAIL'
+
+check_sing_box 'domcase-dynamic-singbox-check' "$rs1"
+
+# ── Scenario 2: text list mode ──────────────────────────────────────────────
+CFG_s2_user_domain_list_type="text"
+CFG_s2_user_domains_text="$(printf 'Example.COM, sub.Example.ORG // comment\nMixed.Case.NET test.com')"
+configure_user_domain_list "s2" "route-rule-s2"
+rs2="$RULESET_DIR/s2-user-domains.json"
+
+expect_domains "$(domains_of "$rs2")" "example.com,mixed.case.net,sub.example.org,test.com" 'domcase-text-domains'
+all_lowercase "$rs2" && echo 'domcase-text-all-lowercase:OK' || echo 'domcase-text-all-lowercase:FAIL'
+
+check_sing_box 'domcase-text-singbox-check' "$rs2"
+
+# ── Scenario 3: plain domain list file (local list / remote plain list) ─────
+LISTFILE="$RULESET_DIR/list.txt"
+printf 'Example.COM\nsub.Example.ORG\nexample.com\n\n' > "$LISTFILE"
+rs3="$RULESET_DIR/s3-local-domains.json"
+create_source_rule_set "$rs3"
+import_plain_domain_list_to_local_source_ruleset_chunked "$LISTFILE" "$rs3"
+
+expect_domains "$(domains_of "$rs3")" "example.com,sub.example.org" 'domcase-listfile-domains'
+all_lowercase "$rs3" && echo 'domcase-listfile-all-lowercase:OK' || echo 'domcase-listfile-all-lowercase:FAIL'
+
+# ── Scenario 4: upgrade simulation — old config, list enabled but empty ─────
+# The UCI option is absent (exactly the upgraded-config case for a newly added
+# option): building must not abort and the result must stay a valid config.
+CFG_s4_user_domain_list_type="dynamic"
+unset CFG_s4_user_domains
+configure_user_domain_list "s4" "route-rule-s4"
+rs4="$RULESET_DIR/s4-user-domains.json"
+[ -f "$rs4" ] && echo 'domcase-empty-no-crash:OK' || echo 'domcase-empty-no-crash:FAIL'
+check_sing_box 'domcase-empty-singbox-check' "$rs4"
+
+echo 'DONE'
+DOMCASEEOF
+    sed -i "s|HELPERS_PATH|$lib/helpers.sh|; s|RULESETS_PATH|$lib/rulesets.sh|; s|BIN_PATH_PLACEHOLDER|$bin|; s|WORK_PATH|$work|g" "$drv"
+
+    # Run the driver to a RESULT FILE, then consume tokens in the CURRENT shell
+    # (while read < file — NO pipe) so pass/fail/skip mutate the real counters.
+    local out="$work/out.log" saw_done=0 line
+    sh "$drv" > "$out" 2>&1 || true
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK)   pass "$line" ;;
+            *:FAIL) fail "$line" ;;
+            *:SKIP) skip "$line" ;;
+            DONE)   saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "domcase-driver-completed:OK"
+    else
+        fail "domcase-driver-completed:FAIL (driver aborted early)"
     fi
 
     rm -rf "$work"
@@ -8591,6 +8803,7 @@ main() {
             test_unsupported_skip
             test_text_list_outbound
             test_ruleset_chunk_size
+            test_domain_case
             test_diagnostics
             test_subscription
             test_fastest_group
@@ -8623,6 +8836,7 @@ main() {
         unsupported) test_unsupported_skip ;;
         textlist)    test_text_list_outbound ;;
         chunkcheck)  test_ruleset_chunk_size ;;
+        domcase)     test_domain_case ;;
         diagnostics) test_diagnostics ;;
         subscription) test_subscription ;;
         fastest)     test_fastest_group ;;
@@ -8647,7 +8861,7 @@ main() {
         sb)          test_sing_box_config ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload domsep"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac

@@ -57,7 +57,9 @@ patch_source_ruleset_rules() {
     mv "$tmpfile" "$filepath"
 }
 
-# Imports a plain domain list into a ruleset in chunks, validating domains and appending them as domain_suffix rules
+# Imports a plain domain list into a ruleset in chunks, validating domains and appending them as domain_suffix rules.
+# Domains are lowercased before validation (issue #52), so a mixed-case entry
+# such as "Example.COM" becomes "example.com" instead of being dropped.
 import_plain_domain_list_to_local_source_ruleset_chunked() {
     local plain_list_filepath="$1"
     local ruleset_filepath="$2"
@@ -69,6 +71,8 @@ import_plain_domain_list_to_local_source_ruleset_chunked() {
         line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
         [ -z "$line" ] && continue
+
+        line="$(normalize_domain_case "$line")"
 
         if ! is_domain_suffix "$line"; then
             log "'$line' is not a valid domain" "debug"
