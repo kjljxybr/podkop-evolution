@@ -915,11 +915,34 @@ restore_sing_box_cache() {
 
     mkdir -p "$(dirname "$cache_path")"
     if cp "$NETSHIFT_CACHE_BACKUP" "$cache_path" 2> /dev/null; then
+        # Marks that the cache now running came from the copy, so the monitor can
+        # drop it if sing-box turns out not to start with it (see
+        # discard_restored_sing_box_cache). Best-effort: a missing flag only
+        # costs the self-heal, never the restore itself.
+        mkdir -p "$(dirname "$NETSHIFT_CACHE_RESTORED_FLAG")" 2> /dev/null
+        : > "$NETSHIFT_CACHE_RESTORED_FLAG" 2> /dev/null || true
         log "Restored sing-box cache from $NETSHIFT_CACHE_BACKUP (selected servers kept after reboot)" "info"
     else
         rm -f "$cache_path"
         log "Failed to restore sing-box cache from $NETSHIFT_CACHE_BACKUP" "warn"
     fi
+}
+
+# A copy sing-box refuses to open would keep it down: the copy is on flash, the
+# live DB is recreated from it on every boot, and restore_sing_box_cache skips a
+# live DB that already exists, so the failure repeats after each reboot with no
+# way out short of removing the file by hand over SSH. So after a crash that
+# followed a restore, drop the restored DB and the copy once and let sing-box
+# start with a clean one. The selected server goes back to default — which is
+# what happened before this feature existed — instead of leaving the tunnel down.
+discard_restored_sing_box_cache() {
+    [ -f "$NETSHIFT_CACHE_RESTORED_FLAG" ] || return 0
+
+    local cache_path
+    cache_path="$(get_sing_box_cache_path)"
+    rm -f "$cache_path" "$NETSHIFT_CACHE_BACKUP" "$NETSHIFT_CACHE_SELECTION" \
+        "$NETSHIFT_CACHE_RESTORED_FLAG"
+    log "sing-box did not start with the restored cache; dropped it and its copy and will start with a clean cache (the selected server is back to default)" "error"
 }
 
 # Prints "group<TAB>selected" for every selector of the running sing-box, sorted.
@@ -949,6 +972,13 @@ snapshot_sing_box_cache() {
     cache_path="$(get_sing_box_cache_path)"
     sing_box_cache_is_volatile "$cache_path" || return 0
     [ -f "$cache_path" ] || return 0
+
+    # Without flock two snapshots could interleave cp/mv and leave a partial
+    # copy behind; refuse loudly rather than degrade into a silent no-op.
+    if ! command -v flock > /dev/null 2>&1; then
+        log "flock is not available; the sing-box cache copy is disabled" "warn"
+        return 0
+    fi
 
     mkdir -p "$(dirname "$NETSHIFT_CACHE_BACKUP_LOCK")" "$NETSHIFT_STATE_DIR"
     (
@@ -1278,6 +1308,11 @@ monitor_sing_box() {
 
         crash_count=$((crash_count + 1))
         log "sing-box process died unexpectedly (crash #$crash_count), restoring DNS" "warn"
+
+        # If the cache currently in tmpfs came from the flash copy, this crash may
+        # be that copy being unusable. Drop it once so the restart below starts
+        # from a clean cache instead of failing on every boot (no-op otherwise).
+        discard_restored_sing_box_cache
 
         dnsmasq_restore
 

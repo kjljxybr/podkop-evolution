@@ -13,6 +13,12 @@ NETSHIFT_STATE_DIR="/etc/netshift"
 NETSHIFT_CACHE_BACKUP="$NETSHIFT_STATE_DIR/cache.db"
 NETSHIFT_CACHE_SELECTION="$NETSHIFT_STATE_DIR/cache.db.selection"
 NETSHIFT_CACHE_BACKUP_LOCK="/var/lock/netshift-cache-backup.lock"
+# Set when restore_sing_box_cache put a copy back into tmpfs on this boot. A copy
+# sing-box then refuses to open would fail on every boot, because the copy lives
+# on flash and is put back again each time; the monitor uses this flag to drop
+# the restored cache once and let sing-box start clean instead. tmpfs on purpose:
+# it only ever means "the cache running right now came from a copy".
+NETSHIFT_CACHE_RESTORED_FLAG="/var/run/netshift-cache-restored"
 RESOLV_CONF="/etc/resolv.conf"
 DNS_RESOLVERS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.11 94.140.14.14 94.140.15.15 208.67.220.220 208.67.222.222 77.88.8.1 77.88.8.8"
 CHECK_PROXY_IP_DOMAIN="ip.podkop.fyi"

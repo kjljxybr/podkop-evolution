@@ -10488,9 +10488,11 @@ extract() {
 eval "$(extract get_sing_box_cache_path)"
 eval "$(extract sing_box_cache_is_volatile)"
 eval "$(extract restore_sing_box_cache)"
+eval "$(extract discard_restored_sing_box_cache)"
 eval "$(extract get_sing_box_selection)"
 eval "$(extract snapshot_sing_box_cache)"
 eval "$(extract monitor_sing_box)"
+eval "$(extract clash_api)"
 
 CP_DIR="/tmp/netshift-cachepersist-state-$$"
 rm -rf "$CP_DIR"
@@ -10499,6 +10501,7 @@ NETSHIFT_STATE_DIR="$CP_DIR/state"
 NETSHIFT_CACHE_BACKUP="$NETSHIFT_STATE_DIR/cache.db"
 NETSHIFT_CACHE_SELECTION="$NETSHIFT_STATE_DIR/cache.db.selection"
 NETSHIFT_CACHE_BACKUP_LOCK="$CP_DIR/lock/cache-backup.lock"
+NETSHIFT_CACHE_RESTORED_FLAG="$CP_DIR/run/cache-restored"
 LIVE="$CP_DIR/live/cache.db"
 LOG="$CP_DIR/log"
 
@@ -10506,6 +10509,7 @@ log() { printf '%s %s\n' "${2:-info}" "$1" >> "$LOG"; }
 CFG_CACHE_PATH="$LIVE"
 CFG_LISTEN=""
 CFG_SECRET=""
+CFG_SHUTDOWN="1"
 CFG_LAN_IP="192.168.1.1"
 config_get() {
     local __v=""
@@ -10513,18 +10517,21 @@ config_get() {
     cache_path) __v="$CFG_CACHE_PATH" ;;
     service_listen_address) __v="$CFG_LISTEN" ;;
     yacd_secret_key) __v="$CFG_SECRET" ;;
-    shutdown_correctly) __v="1" ;;
+    shutdown_correctly) __v="$CFG_SHUTDOWN" ;;
     esac
     [ -n "$__v" ] || __v="$4"
     eval "$1=\$__v"
 }
+config_get_bool() { eval "$1=\"\${4:-0}\""; }
+get_service_listen_address() { printf '%s' "127.0.0.1"; }
 config_load() { :; }
 network_get_ipaddr() { eval "$1=\$CFG_LAN_IP"; }
 
 reset_state() {
-    rm -rf "$CP_DIR/live" "$NETSHIFT_STATE_DIR" "$LOG"
+    rm -rf "$CP_DIR/live" "$NETSHIFT_STATE_DIR" "$LOG" "$CP_DIR/run"
     mkdir -p "$NETSHIFT_STATE_DIR"
     CFG_CACHE_PATH="$LIVE"
+    CFG_SHUTDOWN="1"
 }
 live_db() {
     mkdir -p "$(dirname "$LIVE")"
@@ -10681,11 +10688,66 @@ snapshot_sing_box_cache() { SNAPSHOTS=$((SNAPSHOTS + 1)); }
 monitor_sing_box
 check cp-monitor-snapshots-once-per-minute '[ "$SNAPSHOTS" = "1" ]'
 
+# ── restore marks the cache as restored; a crash then heals it ─────────
+# H1: a restore records that the cache now running came from the copy.
+reset_state
+printf 'saved-db' > "$NETSHIFT_CACHE_BACKUP"
+restore_sing_box_cache
+check cp-restore-sets-restored-flag '[ -f "$NETSHIFT_CACHE_RESTORED_FLAG" ]'
+
+# H2: a crash after a restore drops the restored DB and the copy, so the next
+#     start is clean instead of failing on the same file after every reboot.
+discard_restored_sing_box_cache
+check cp-heal-drops-restored-cache '[ ! -e "$LIVE" ] && [ ! -e "$NETSHIFT_CACHE_BACKUP" ] && [ ! -e "$NETSHIFT_CACHE_RESTORED_FLAG" ]'
+
+# H3: without a restore this boot, nothing is dropped.
+reset_state
+live_db 'live-db'
+printf 'good-db' > "$NETSHIFT_CACHE_BACKUP"
+discard_restored_sing_box_cache
+check cp-heal-noop-without-restore '[ -e "$LIVE" ] && [ -e "$NETSHIFT_CACHE_BACKUP" ]'
+
+# H4: the monitor heals on the first crash after a restore, not only when the
+#     function is called directly.
+reset_state
+live_db 'live-db'
+printf 'bad-db' > "$NETSHIFT_CACHE_BACKUP"
+mkdir -p "$(dirname "$NETSHIFT_CACHE_RESTORED_FLAG")"
+: > "$NETSHIFT_CACHE_RESTORED_FLAG"
+MONITOR_PIDFILE="$CP_DIR/monitor-heal.pid"
+MONITOR_MAX_CRASHES=1
+CFG_SHUTDOWN="0"
+dnsmasq_restore() { :; }
+sing_box_process_exists() { return 1; }
+monitor_sing_box
+check cp-monitor-heals-restored-cache '[ ! -e "$NETSHIFT_CACHE_BACKUP" ] && [ ! -e "$LIVE" ]'
+
+# ── clash_api 204 branch snapshots the cache (the LuCI pick) ───────────
+# A grep of the source cannot tell a real call from a commented-out one, so
+# drive the branch: a successful PATCH answers 204 and must snapshot inline,
+# a 404 must not.
+reset_state
+live_db 'live-db'
+SELECTION="$(printf 'main-out\tnode-a')"
+SNAPSHOTS=0
+snapshot_sing_box_cache() { SNAPSHOTS=$((SNAPSHOTS + 1)); }
+curl() { printf '\n204'; }
+clash_api set_group_proxy main-out node-a > /dev/null 2>&1
+check cp-clash-api-204-snapshots '[ "$SNAPSHOTS" = "1" ]'
+curl() { printf '\n404'; }
+SNAPSHOTS=0
+clash_api set_group_proxy main-out node-a > /dev/null 2>&1
+check cp-clash-api-404-no-snapshot '[ "$SNAPSHOTS" = "0" ]'
+eval "$(extract snapshot_sing_box_cache)"
+
 # ── wiring in the shipped bin ──────────────────────────────────────────
+# An UNCOMMENTED call, not just the token appearing somewhere: a commented-out
+# call must fail these.
 start_body="$(extract start_main)"
-check cp-start-restores-before-sing-box 'printf "%s\n" "$start_body" | awk "/restore_sing_box_cache/{r=NR} /\\/etc\\/init.d\\/sing-box start/{s=NR} END{exit !(r && s && r < s)}"'
-check cp-set-group-proxy-snapshots 'extract clash_api | awk "/^        204\\)/{p=1} p&&/;;/{exit} p" | grep -q "snapshot_sing_box_cache"'
-check cp-stop-does-not-snapshot '! extract stop_main | grep -q "snapshot_sing_box_cache"'
+check cp-start-restores-before-sing-box 'printf "%s\n" "$start_body" | awk "/^[[:space:]]*restore_sing_box_cache/{r=NR} /sing-box start/{s=NR} END{exit !(r && s && r < s)}"'
+check cp-set-group-proxy-snapshots 'extract clash_api | awk "/^        204\\)/{p=1} p&&/;;/{exit} p" | grep -qE "^[[:space:]]*snapshot_sing_box_cache"'
+check cp-stop-does-not-snapshot '! extract stop_main | grep -qE "^[[:space:]]*snapshot_sing_box_cache"'
+check cp-monitor-heals-on-crash 'extract monitor_sing_box | grep -qE "^[[:space:]]*discard_restored_sing_box_cache"'
 
 rm -rf "$CP_DIR"
 echo DONE
