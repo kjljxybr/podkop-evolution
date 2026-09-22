@@ -4876,6 +4876,34 @@ another stray line {not-json}
         fail "noisy-stdout parse wrong" "$noisy_status"
     fi
 
+    # ── 2d. a worker warning reaches the status the UI polls ─────────────────
+    # The stable core switch reports a pin it had to leave in the apk world as
+    # "warning" next to success:true; dropping it here would leave it CLI-only.
+    local warn_json warn_id warn_status
+    warn_json="$(JOBSTUB_DIR="$jdir" \
+        STUB_JSON='{"success":true,"version":"1.12.0","warning":"apk world pins sing-box"}' \
+        "$stub" component_action_async sing_box install_stable)"
+    warn_id="$(echo "$warn_json" | jq -r '.job_id')"
+    waited=0
+    while [ "$waited" -lt 15 ]; do
+        if jq -e '.running == false' "$jdir/$warn_id.json" > /dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    warn_status="$(JOBSTUB_DIR="$jdir" "$stub" component_action_status "$warn_id")"
+    if echo "$warn_status" | jq -e '.running == false and .success == true and .warning == "apk world pins sing-box"' > /dev/null 2>&1; then
+        pass "finished status surfaces the worker warning"
+    else
+        fail "worker warning not surfaced" "$warn_status"
+    fi
+    if echo "$status_json" | jq -e '.warning == ""' > /dev/null 2>&1; then
+        pass "finished status without a worker warning has an empty one"
+    else
+        fail "finished status warning not empty" "$status_json"
+    fi
+
     # ── 3. invalid / traversal job ids are rejected safely ──────────────────
     local bad bad_json bad_rc bad_out="/tmp/netshift-jobstate-bad-$$"
     for bad in "../foo" "../../etc/passwd" "foo/bar" "a b" "" "."; do
@@ -5040,6 +5068,16 @@ update) exit 0 ;;
 install)
     if [ -f "$SELFHEAL_PKG_OK" ]; then
         printf 'stable-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+        # A package manager that reports success yet leaves no runnable core
+        # (half-written binary, missing library): the updater must catch that
+        # instead of restarting NetShift onto nothing.
+        [ -f "$SELFHEAL_PKG_BREAKS_CORE" ] && rm -f "$SELFHEAL_BIN"
+        # Same, with a core that still prints a version line but exits non-zero
+        # (a build that crashes after printing): the output alone must not pass.
+        if [ -f "$SELFHEAL_PKG_CORE_FAILS" ]; then
+            printf '%s\n' '#!/bin/sh' 'echo "sing-box version stable-1.12.0"' 'exit 1' > "$SELFHEAL_BIN"
+            chmod 0755 "$SELFHEAL_BIN"
+        fi
         exit 0
     fi
     # Simulate a package failure that ALSO removed the live binary (the brick
@@ -5053,10 +5091,15 @@ OPKGEOF
     chmod 0755 "$work/bin/dig" "$work/bin/nslookup" "$work/bin/curl" "$work/bin/opkg"
 
     # Fake /etc/init.d/netshift: records each invocation (stop/start/restart) to
-    # a log so the driver can assert teardown/bring-up happened.
+    # a log so the driver can assert teardown/bring-up happened, plus a
+    # `backup-present` line when the stable path's tmpfs backup still exists at
+    # that moment.
     cat > "$work/init/netshift" << 'INITEOF'
 #!/bin/sh
 printf '%s\n' "$1" >> "$SELFHEAL_INIT_LOG"
+for d in /tmp/netshift-sbstable.*; do
+    [ -e "$d" ] && printf 'backup-present\n' >> "$SELFHEAL_INIT_LOG"
+done
 exit 0
 INITEOF
     chmod 0755 "$work/init/netshift"
@@ -5075,6 +5118,8 @@ UPDATES_GITHUB_PROBE_HOST="github.test"
 UPDATES_HEAL_RESOLVERS="1.1.1.1 9.9.9.9"
 UPDATES_SING_BOX_BIN="$SELFHEAL_BIN"
 UPDATES_LIBCRONET_LIB="DRV_CRONET"
+UPDATES_APK_WORLD="$SELFHEAL_APK_WORLD"
+UPDATES_APK_FETCH_DIR="$SELFHEAL_APK_FETCH_DIR"
 . "DRV_UPDATER"
 # Re-pin after sourcing (the source sets its own defaults).
 RESOLV_CONF="DRV_RESOLV"
@@ -5084,6 +5129,8 @@ UPDATES_GITHUB_PROBE_HOST="github.test"
 UPDATES_HEAL_RESOLVERS="1.1.1.1 9.9.9.9"
 UPDATES_SING_BOX_BIN="$SELFHEAL_BIN"
 UPDATES_LIBCRONET_LIB="DRV_CRONET"
+UPDATES_APK_WORLD="$SELFHEAL_APK_WORLD"
+UPDATES_APK_FETCH_DIR="$SELFHEAL_APK_FETCH_DIR"
 
 # Mocked helpers used by the stable core (normally from helpers.sh).
 get_sing_box_version() { cat "$SELFHEAL_CORE_VERSION" 2>/dev/null; }
@@ -5121,6 +5168,39 @@ DRVEOF
     export SELFHEAL_INIT_LOG="$work/init.log"
     export SELFHEAL_CORE_VERSION="$work/core.version"
     export SELFHEAL_BIN="$work/usr-bin-sing-box"
+    export SELFHEAL_PKG_BREAKS_CORE="$work/pkg_breaks_core"
+    export SELFHEAL_PKG_CORE_FAILS="$work/pkg_core_fails"
+    export SELFHEAL_APK_LOG="$work/apk.log"
+    export SELFHEAL_APK_FETCHED_TO="$work/apk_fetched_to"
+    mkdir -p "$work/fetch"
+    export SELFHEAL_APK_FETCH_DIR="$work/fetch/apk-fetch"
+
+    # The "NetShift was not restarted" assertions below read init.log, and they
+    # mean something only if the init stub installed above really logs there.
+    : > "$SELFHEAL_INIT_LOG"
+    "$init_target" selfcheck > /dev/null 2>&1 || true
+    if grep -qx 'selfcheck' "$SELFHEAL_INIT_LOG" 2>/dev/null; then
+        pass "selfheal-init-stub-logs:OK"
+    else
+        fail "selfheal-init-stub-logs:FAIL" "init.log=$(cat "$SELFHEAL_INIT_LOG" 2>/dev/null)"
+    fi
+
+    # The fake sing-box core has to be a runnable program: the stable path now
+    # reads the version by executing $UPDATES_SING_BOX_BIN rather than trusting
+    # get_sing_box_version()'s PATH lookup, which answers "1.0" for a missing or
+    # broken core and would let a core-less router pass as a good downgrade.
+    # $1 is a marker baked into the script so the rollback assertions can tell
+    # the restored bytes apart; the version it reports lives in a separate file
+    # that the package-manager stubs rewrite on a successful install.
+    make_fake_core() {
+        cat > "$SELFHEAL_BIN" << COREEOF
+#!/bin/sh
+# core-marker: ${1:-PLAIN-CORE-BYTES}
+[ "\$1" = "version" ] || exit 1
+printf 'sing-box version %s\n' "\$(cat "\$SELFHEAL_CORE_VERSION" 2>/dev/null)"
+COREEOF
+        chmod 0755 "$SELFHEAL_BIN"
+    }
 
     local out="$work/out.json"
 
@@ -5128,7 +5208,8 @@ DRVEOF
         # The worker returns non-zero on recoverable failures (success:false);
         # under `set -e` that would abort the suite, so swallow the rc here — the
         # assertions read the JSON + file state, not the exit code.
-        rm -f "$work/init.log"
+        rm -f "$SELFHEAL_APK_LOG" "$SELFHEAL_APK_FETCHED_TO"
+        : > "$work/init.log"
         PATH="$work/bin:$PATH" ash "$drv" run_stable > "$out" 2>/dev/null || true
     }
 
@@ -5136,7 +5217,7 @@ DRVEOF
     : > "$SELFHEAL_DNS_OK"; : > "$SELFHEAL_HTTP_OK"; : > "$SELFHEAL_PKG_OK"
     printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
     printf 'original-resolver\n' > "$work/resolv.conf"
-    : > "$work/usr-bin-sing-box"
+    make_fake_core
     run_scenario
     if jq -e '.success == true' "$out" > /dev/null 2>&1; then
         pass "selfheal-preflight-pass-proceeds:OK"
@@ -5153,6 +5234,15 @@ DRVEOF
     else
         fail "selfheal-preflight-pass-resolv-untouched:FAIL" "$(cat "$work/resolv.conf" 2>/dev/null)"
     fi
+    # Restart ordering on the opkg path too (the move is shared by both package
+    # managers): NetShift comes back only once the tmpfs backup — a full copy of
+    # the extended core — has been freed.
+    if grep -qx 'restart' "$work/init.log" 2>/dev/null && \
+            ! grep -q 'backup-present' "$work/init.log" 2>/dev/null; then
+        pass "selfheal-opkg-restart-after-backup-freed:OK"
+    else
+        fail "selfheal-opkg-restart-after-backup-freed:FAIL" "init.log=$(cat "$work/init.log" 2>/dev/null)"
+    fi
 
     # ── Scenario 2: pre-flight fails → DNS heal succeeds → resolv restored ────
     # DNS fails first, but once the temp resolver is written DNS+HTTP pass. We
@@ -5164,7 +5254,7 @@ DRVEOF
     rm -f "$SELFHEAL_DNS_OK"; : > "$SELFHEAL_HTTP_OK"; : > "$SELFHEAL_PKG_OK"
     printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
     printf 'original-resolver\n' > "$work/resolv.conf"
-    : > "$work/usr-bin-sing-box"
+    make_fake_core
     # dig stub variant for scenario 2: DNS resolves only once resolv.conf holds
     # the temp resolver (i.e. after the heal wrote it).
     cat > "$work/bin/dig" << 'DIG2EOF'
@@ -5200,7 +5290,7 @@ DIG2EOF
     rm -f "$SELFHEAL_DNS_OK"; rm -f "$SELFHEAL_HTTP_OK"; : > "$SELFHEAL_PKG_OK"
     printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
     printf 'original-resolver\n' > "$work/resolv.conf"
-    : > "$work/usr-bin-sing-box"
+    make_fake_core
     # DNS resolves only with temp resolver present (as scenario 2).
     # HTTP succeeds only after init stop has been recorded.
     cat > "$work/bin/curl" << 'CURL3EOF'
@@ -5235,7 +5325,7 @@ CURL3EOF
     rm -f "$SELFHEAL_DNS_OK"; rm -f "$SELFHEAL_HTTP_OK"; : > "$SELFHEAL_PKG_OK"
     printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
     printf 'original-resolver\n' > "$work/resolv.conf"
-    : > "$work/usr-bin-sing-box"
+    make_fake_core
     # DNS never resolves; HTTP never reachable even after teardown.
     cat > "$work/bin/dig" << 'DIG4EOF'
 #!/bin/sh
@@ -5275,7 +5365,7 @@ CURL4EOF
     : > "$SELFHEAL_DNS_OK"; : > "$SELFHEAL_HTTP_OK"; rm -f "$SELFHEAL_PKG_OK"
     printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
     printf 'original-resolver\n' > "$work/resolv.conf"
-    printf 'EXTENDED-CORE-BYTES\n' > "$work/usr-bin-sing-box"
+    make_fake_core EXTENDED-CORE-BYTES
     # Connectivity is fine; dig/curl just check the markers.
     cat > "$work/bin/dig" << 'DIG5EOF'
 #!/bin/sh
@@ -5296,12 +5386,409 @@ CURL5EOF
     fi
     # The opkg stub removed the live binary; the tmpfs backup must be restored
     # so a working binary remains with the ORIGINAL extended bytes.
-    if [ -e "$work/usr-bin-sing-box" ] && \
-            [ "$(cat "$work/usr-bin-sing-box" 2>/dev/null)" = "EXTENDED-CORE-BYTES" ]; then
+    if grep -q 'core-marker: EXTENDED-CORE-BYTES' "$work/usr-bin-sing-box" 2>/dev/null; then
         pass "selfheal-stable-install-fail-backup-restored:OK"
     else
         fail "selfheal-stable-install-fail-backup-restored:FAIL" "$(cat "$work/usr-bin-sing-box" 2>/dev/null)"
     fi
+
+    # ── apk-tools 3 scenarios (OpenWrt 25.12+). The stub mirrors apk 3.0.5 as
+    # observed on a router: there is no --allow-downgrade; `fix` (and `add
+    # --force-reinstall NAME`) exit 0 without reinstalling when the installed
+    # build is no longer in the feed index; `fetch` downloads the feed package;
+    # a package file installs only with --allow-untrusted and pins its hash in
+    # the world file. It is created only here, so scenarios 1-5 stay on opkg.
+    cat > "$work/bin/apk" << 'APKEOF'
+#!/bin/sh
+for a in "$@"; do
+    if [ "$a" = "--allow-downgrade" ]; then
+        echo "ERROR: command line: unrecognized option 'allow-downgrade'" >&2
+        exit 1
+    fi
+done
+set_world_entry() {
+    grep -v '^sing-box' "$SELFHEAL_APK_WORLD" > "$SELFHEAL_APK_WORLD.new" 2>/dev/null
+    [ -n "$1" ] && printf '%s\n' "$1" >> "$SELFHEAL_APK_WORLD.new"
+    mv -f "$SELFHEAL_APK_WORLD.new" "$SELFHEAL_APK_WORLD"
+}
+cmd="$1"
+printf '%s\n' "$cmd" >> "$SELFHEAL_APK_LOG"
+shift
+case "$cmd" in
+update) exit 0 ;;
+fix)
+    [ -f "$SELFHEAL_APK_INDEXED" ] && printf 'stable-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    exit 0
+    ;;
+fetch)
+    [ -f "$SELFHEAL_APK_FETCH_OK" ] || exit 1
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = "-o" ]; then
+            printf '%s\n' "$2" > "$SELFHEAL_APK_FETCHED_TO"
+            : > "$2/sing-box-1.12.0-r1.apk"
+            exit 0
+        fi
+        shift
+    done
+    exit 1
+    ;;
+add)
+    untrusted=0
+    reinstall=0
+    file=""
+    name=""
+    for a in "$@"; do
+        case "$a" in
+        --allow-untrusted) untrusted=1 ;;
+        --force-reinstall) reinstall=1 ;;
+        -*) ;;
+        *.apk) file="$a" ;;
+        *) name="$a" ;;
+        esac
+    done
+    if [ -n "$file" ]; then
+        [ "$untrusted" -eq 1 ] || exit 99
+        [ -f "$file" ] || exit 1
+        printf 'stable-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+        set_world_entry 'sing-box><Q1FAKEHASH='
+        exit 0
+    fi
+    if [ "$reinstall" -eq 1 ] && [ -f "$SELFHEAL_APK_INDEXED" ]; then
+        printf 'stable-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    fi
+    # A version-pinned world entry can no longer be satisfied once the feed has
+    # moved on; apk rejects it and leaves the world as it is.
+    case "$name" in
+    *=*)
+        if [ "${name#*=}" != "$(cat "$SELFHEAL_APK_FEED_VERSION" 2>/dev/null)" ]; then
+            echo "ERROR: unable to select packages: breaks: world[$name]" >&2
+            exit 2
+        fi
+        ;;
+    esac
+    [ -n "$name" ] && set_world_entry "$name"
+    exit 0
+    ;;
+del)
+    # Removing a world entry also drops reverse dependencies that are not world
+    # members themselves, so the package (and NetShift with it) can disappear.
+    # The marker models an apk that takes the core even though netshift IS a
+    # world member — the caller must not trust the dependency blindly.
+    if [ -f "$SELFHEAL_APK_DEL_PURGES" ] || ! grep -q '^netshift' "$SELFHEAL_APK_WORLD" 2>/dev/null; then
+        rm -f "$SELFHEAL_BIN" 2>/dev/null
+    fi
+    [ -f "$SELFHEAL_APK_DEL_PURGES_NETSHIFT" ] && rm -f /etc/init.d/netshift
+    set_world_entry ""
+    exit 0
+    ;;
+esac
+exit 0
+APKEOF
+    chmod 0755 "$work/bin/apk"
+    export SELFHEAL_APK_INDEXED="$work/apk_indexed"
+    export SELFHEAL_APK_FETCH_OK="$work/apk_fetch_ok"
+    export SELFHEAL_APK_WORLD="$work/apk-world"
+    export SELFHEAL_APK_FEED_VERSION="$work/apk_feed_version"
+    export SELFHEAL_APK_DEL_PURGES="$work/apk_del_purges"
+    export SELFHEAL_APK_DEL_PURGES_NETSHIFT="$work/apk_del_purges_netshift"
+    printf '1.12.0-r1\n' > "$SELFHEAL_APK_FEED_VERSION"
+    rm -f "$SELFHEAL_APK_DEL_PURGES"
+
+    # ── Scenario 6 (apk): installed build still in the feed index → in-place
+    # reinstall lands; NetShift restarts only once the tmpfs backup is gone.
+    : > "$SELFHEAL_DNS_OK"; : > "$SELFHEAL_HTTP_OK"; rm -f "$SELFHEAL_PKG_OK"
+    : > "$SELFHEAL_APK_INDEXED"; : > "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true' "$out" > /dev/null 2>&1 && \
+            [ "$(cat "$SELFHEAL_CORE_VERSION" 2>/dev/null)" = "stable-1.12.0" ]; then
+        pass "selfheal-apk-indexed-stable-installed:OK"
+    else
+        fail "selfheal-apk-indexed-stable-installed:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+    if [ "$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "netshift" ]; then
+        pass "selfheal-apk-indexed-world-untouched:OK"
+    else
+        fail "selfheal-apk-indexed-world-untouched:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)"
+    fi
+    if grep -qx 'restart' "$work/init.log" 2>/dev/null && \
+            ! grep -q 'backup-present' "$work/init.log" 2>/dev/null; then
+        pass "selfheal-apk-restart-after-backup-freed:OK"
+    else
+        fail "selfheal-apk-restart-after-backup-freed:FAIL" "init.log=$(cat "$work/init.log" 2>/dev/null)"
+    fi
+
+    # ── Scenario 7 (apk): installed build no longer in the feed index (the feed
+    # was rebuilt) → `apk fix` skips silently, so the feed package file must be
+    # installed instead, without leaving its hash pinned in the world file.
+    rm -f "$SELFHEAL_APK_INDEXED"; : > "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\n' > "$SELFHEAL_APK_WORLD"
+    # Download directory left on flash by a run that was killed mid-fetch.
+    mkdir -p "$SELFHEAL_APK_FETCH_DIR.stale1"
+    : > "$SELFHEAL_APK_FETCH_DIR.stale1/sing-box-1.11.0-r1.apk"
+    run_scenario
+    if jq -e '.success == true' "$out" > /dev/null 2>&1 && \
+            [ "$(cat "$SELFHEAL_CORE_VERSION" 2>/dev/null)" = "stable-1.12.0" ]; then
+        pass "selfheal-apk-unindexed-stable-installed:OK"
+    else
+        fail "selfheal-apk-unindexed-stable-installed:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+    # The package is downloaded next to the binary, not into the tmpfs
+    # directory that holds the backup of the extended core.
+    case "$(cat "$SELFHEAL_APK_FETCHED_TO" 2>/dev/null)" in
+    /tmp/netshift-sbstable.*)
+        fail "selfheal-apk-fetch-not-in-backup-tmpfs:FAIL" "fetched to $(cat "$SELFHEAL_APK_FETCHED_TO")"
+        ;;
+    "$SELFHEAL_APK_FETCH_DIR".*)
+        pass "selfheal-apk-fetch-not-in-backup-tmpfs:OK"
+        ;;
+    *)
+        fail "selfheal-apk-fetch-not-in-backup-tmpfs:FAIL" "fetched to '$(cat "$SELFHEAL_APK_FETCHED_TO" 2>/dev/null)'"
+        ;;
+    esac
+    if [ -z "$(ls -d "$SELFHEAL_APK_FETCH_DIR".* 2>/dev/null)" ]; then
+        pass "selfheal-apk-fetch-dirs-cleaned:OK"
+    else
+        fail "selfheal-apk-fetch-dirs-cleaned:FAIL" "$(ls -d "$SELFHEAL_APK_FETCH_DIR".* 2>/dev/null)"
+    fi
+    if jq -e '.success == true' "$out" > /dev/null 2>&1 && \
+            [ "$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "netshift" ]; then
+        pass "selfheal-apk-unindexed-world-pin-dropped:OK"
+    else
+        fail "selfheal-apk-unindexed-world-pin-dropped:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)"
+    fi
+    # Same, but sing-box was an explicit world entry → that entry is kept.
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\nsing-box\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true' "$out" > /dev/null 2>&1 && \
+            [ "$(grep '^sing-box' "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "sing-box" ]; then
+        pass "selfheal-apk-unindexed-world-entry-kept:OK"
+    else
+        fail "selfheal-apk-unindexed-world-entry-kept:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 8 (apk): the switch does not land (not in the index and the
+    # fetch fails) → success:false, core intact, and NetShift is NOT restarted.
+    rm -f "$SELFHEAL_APK_INDEXED"; rm -f "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == false' "$out" > /dev/null 2>&1; then
+        pass "selfheal-apk-not-landed-successfalse:OK"
+    else
+        fail "selfheal-apk-not-landed-successfalse:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+    if grep -q 'core-marker: EXTENDED-CORE-BYTES' "$work/usr-bin-sing-box" 2>/dev/null; then
+        pass "selfheal-apk-not-landed-core-intact:OK"
+    else
+        fail "selfheal-apk-not-landed-core-intact:FAIL" "$(cat "$work/usr-bin-sing-box" 2>/dev/null)"
+    fi
+    if [ -f "$work/init.log" ] && ! grep -q 'restart' "$work/init.log"; then
+        pass "selfheal-apk-not-landed-no-restart:OK"
+    else
+        fail "selfheal-apk-not-landed-no-restart:FAIL" "init.log=$(cat "$work/init.log" 2>/dev/null)"
+    fi
+
+    # ── Scenario 9 (apk): the world held a VERSION PIN the feed no longer has.
+    # Putting it back fails ("breaks: world[sing-box=...]"), but the hash pin the
+    # file install wrote must not survive that: it would silently block every
+    # later `apk upgrade sing-box`. The switch itself stands, and the unrestored
+    # entry is reported in the result rather than only logged.
+    rm -f "$SELFHEAL_APK_INDEXED"; : > "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\nsing-box=1.11.0-r1\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true' "$out" > /dev/null 2>&1 && \
+            ! grep -q '^sing-box><' "$SELFHEAL_APK_WORLD" 2>/dev/null; then
+        pass "selfheal-apk-stale-pin-hash-pin-dropped:OK"
+    else
+        fail "selfheal-apk-stale-pin-hash-pin-dropped:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+    if jq -e '(.warning // "") | length > 0' "$out" > /dev/null 2>&1; then
+        pass "selfheal-apk-stale-pin-reported:OK"
+    else
+        fail "selfheal-apk-stale-pin-reported:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 10 (apk): a repo-tagged world entry ("sing-box@custom") is a
+    # legal entry too — it must be recognised and put back, not silently lost.
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\nsing-box@custom\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if [ "$(grep '^sing-box' "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "sing-box@custom" ] && \
+            jq -e 'has("warning") | not' "$out" > /dev/null 2>&1; then
+        pass "selfheal-apk-tagged-world-entry-kept:OK"
+    else
+        fail "selfheal-apk-tagged-world-entry-kept:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 11 (apk): NetShift is not a world member. `apk del sing-box`
+    # would purge NetShift along with the package, so the pin is left in place
+    # and reported instead — a blocked upgrade beats a purged application.
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'sing-box\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if ! grep -qx 'del' "$SELFHEAL_APK_LOG" 2>/dev/null && [ -x /etc/init.d/netshift ]; then
+        pass "selfheal-apk-no-netshift-in-world-no-del:OK"
+    else
+        fail "selfheal-apk-no-netshift-in-world-no-del:FAIL" "apk.log=$(cat "$SELFHEAL_APK_LOG" 2>/dev/null)"
+    fi
+    if jq -e '.success == true and ((.warning // "") | length > 0)' "$out" > /dev/null 2>&1; then
+        pass "selfheal-apk-no-netshift-in-world-reported:OK"
+    else
+        fail "selfheal-apk-no-netshift-in-world-reported:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 12 (apk): `apk del` takes the core with it after all. The
+    # dependency is not treated as a guarantee: with no runnable core left the
+    # backup is restored and the switch is reported as failed, not successful.
+    : > "$SELFHEAL_APK_DEL_PURGES"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == false' "$out" > /dev/null 2>&1 && \
+            grep -q 'core-marker: EXTENDED-CORE-BYTES' "$SELFHEAL_BIN" 2>/dev/null && \
+            [ -f "$work/init.log" ] && ! grep -q 'restart' "$work/init.log"; then
+        pass "selfheal-apk-del-took-core-rolled-back:OK"
+    else
+        fail "selfheal-apk-del-took-core-rolled-back:FAIL" "out=$(cat "$out" 2>/dev/null) init.log=$(cat "$work/init.log" 2>/dev/null)"
+    fi
+    rm -f "$SELFHEAL_APK_DEL_PURGES"
+
+    # ── Scenario 14 (apk): a hash pin is already in the world before the switch
+    # (left by an earlier run that could not drop it). Comparing the world with
+    # its state before the install cannot see it — two installs of one file
+    # write the same pin — so a hash pin is never taken as the entry to keep,
+    # whichever route the install takes.
+    : > "$SELFHEAL_APK_INDEXED"; : > "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\nsing-box><Q1FAKEHASH=\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true and (has("warning") | not)' "$out" > /dev/null 2>&1 && \
+            [ "$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "netshift" ]; then
+        pass "selfheal-apk-leftover-pin-dropped-fix-route:OK"
+    else
+        fail "selfheal-apk-leftover-pin-dropped-fix-route:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+    rm -f "$SELFHEAL_APK_INDEXED"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\nsing-box><Q1FAKEHASH=\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true and (has("warning") | not)' "$out" > /dev/null 2>&1 && \
+            [ "$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null)" = "netshift" ]; then
+        pass "selfheal-apk-leftover-pin-dropped-file-route:OK"
+    else
+        fail "selfheal-apk-leftover-pin-dropped-file-route:FAIL" "world=$(cat "$SELFHEAL_APK_WORLD" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 15 (apk): the same leftover pin on a router where NetShift is
+    # not a world member — scenario 11 run a second time with the same feed.
+    # The pin cannot be dropped safely, and that must be reported every time,
+    # not only on the run that wrote it.
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'sing-box><Q1FAKEHASH=\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true and ((.warning // "") | contains("sing-box><Q1FAKEHASH="))' "$out" > /dev/null 2>&1 && \
+            ! grep -qx 'del' "$SELFHEAL_APK_LOG" 2>/dev/null; then
+        pass "selfheal-apk-leftover-pin-no-netshift-reported:OK"
+    else
+        fail "selfheal-apk-leftover-pin-no-netshift-reported:FAIL" "apk.log=$(cat "$SELFHEAL_APK_LOG" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+    # "!netshift" excludes NetShift instead of keeping it installed, so it does
+    # not make `apk del sing-box` safe.
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf '!netshift\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true and ((.warning // "") | length > 0)' "$out" > /dev/null 2>&1 && \
+            ! grep -qx 'del' "$SELFHEAL_APK_LOG" 2>/dev/null; then
+        pass "selfheal-apk-excluded-netshift-no-del:OK"
+    else
+        fail "selfheal-apk-excluded-netshift-no-del:FAIL" "apk.log=$(cat "$SELFHEAL_APK_LOG" 2>/dev/null) out=$(cat "$out" 2>/dev/null)"
+    fi
+
+    # ── Scenario 16 (apk): the switch fails (fetch fails) while the world holds
+    # a pin that cannot be dropped: success:false, and the pin is reported in
+    # that result too.
+    rm -f "$SELFHEAL_APK_FETCH_OK"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'sing-box><Q1FAKEHASH=\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == false and ((.warning // "") | contains("sing-box><Q1FAKEHASH="))' "$out" > /dev/null 2>&1 && \
+            grep -q 'core-marker: EXTENDED-CORE-BYTES' "$SELFHEAL_BIN" 2>/dev/null; then
+        pass "selfheal-apk-failed-switch-reports-pin:OK"
+    else
+        fail "selfheal-apk-failed-switch-reports-pin:FAIL" "out=$(cat "$out" 2>/dev/null)"
+    fi
+    : > "$SELFHEAL_APK_FETCH_OK"
+
+    # ── Scenario 17 (apk): `apk del sing-box` removes NetShift although it is a
+    # world member. The core switch stands, and the user is told in the result.
+    : > "$SELFHEAL_APK_DEL_PURGES_NETSHIFT"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    printf 'netshift\n' > "$SELFHEAL_APK_WORLD"
+    run_scenario
+    if jq -e '.success == true and ((.warning // "") | contains("NetShift"))' "$out" > /dev/null 2>&1; then
+        pass "selfheal-apk-del-took-netshift-reported:OK"
+    else
+        fail "selfheal-apk-del-took-netshift-reported:FAIL" "out=$(cat "$out" 2>/dev/null)"
+    fi
+    rm -f "$SELFHEAL_APK_DEL_PURGES_NETSHIFT"
+    cp -p "$work/init/netshift" "$init_target" 2>/dev/null
+    chmod 0755 "$init_target" 2>/dev/null || true
+    rm -f "$work/bin/apk"
+
+    # ── Scenario 13 (opkg): the package manager exits 0 and reports a stable
+    # version, but leaves no runnable core. The version gate must read the
+    # binary itself — get_sing_box_version()'s "1.0" fallback is not extended
+    # either, so trusting it would restart NetShift onto a missing core and call
+    # that a success.
+    : > "$SELFHEAL_DNS_OK"; : > "$SELFHEAL_HTTP_OK"; : > "$SELFHEAL_PKG_OK"
+    : > "$SELFHEAL_PKG_BREAKS_CORE"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    run_scenario
+    if jq -e '.success == false and (.message | contains("runnable"))' "$out" > /dev/null 2>&1; then
+        pass "selfheal-no-runnable-core-successfalse:OK"
+    else
+        fail "selfheal-no-runnable-core-successfalse:FAIL" "$(cat "$out" 2>/dev/null)"
+    fi
+    if grep -q 'core-marker: EXTENDED-CORE-BYTES' "$SELFHEAL_BIN" 2>/dev/null && \
+            [ -f "$work/init.log" ] && ! grep -q 'restart' "$work/init.log"; then
+        pass "selfheal-no-runnable-core-rolled-back:OK"
+    else
+        fail "selfheal-no-runnable-core-rolled-back:FAIL" "core=$(cat "$SELFHEAL_BIN" 2>/dev/null) init.log=$(cat "$work/init.log" 2>/dev/null)"
+    fi
+    rm -f "$SELFHEAL_PKG_BREAKS_CORE"
+    # A core that prints a version line and then exits non-zero is not a
+    # runnable core either.
+    : > "$SELFHEAL_PKG_CORE_FAILS"
+    printf 'extended-1.12.0\n' > "$SELFHEAL_CORE_VERSION"
+    make_fake_core EXTENDED-CORE-BYTES
+    run_scenario
+    if jq -e '.success == false and (.message | contains("runnable"))' "$out" > /dev/null 2>&1 && \
+            grep -q 'core-marker: EXTENDED-CORE-BYTES' "$SELFHEAL_BIN" 2>/dev/null; then
+        pass "selfheal-failing-core-rolled-back:OK"
+    else
+        fail "selfheal-failing-core-rolled-back:FAIL" "out=$(cat "$out" 2>/dev/null) core=$(cat "$SELFHEAL_BIN" 2>/dev/null)"
+    fi
+    rm -f "$SELFHEAL_PKG_CORE_FAILS"
 
     # ── Restore the real init script (if any) and clean up. ──────────────────
     if [ -n "$init_saved" ] && [ -e "$init_saved" ]; then
@@ -5310,7 +5797,11 @@ CURL5EOF
         rm -f "$init_target" 2>/dev/null || true
     fi
     unset SELFHEAL_DNS_OK SELFHEAL_HTTP_OK SELFHEAL_PKG_OK SELFHEAL_INIT_LOG \
-        SELFHEAL_CORE_VERSION SELFHEAL_BIN
+        SELFHEAL_CORE_VERSION SELFHEAL_BIN SELFHEAL_APK_INDEXED \
+        SELFHEAL_APK_FETCH_OK SELFHEAL_APK_WORLD SELFHEAL_APK_FEED_VERSION \
+        SELFHEAL_APK_DEL_PURGES SELFHEAL_APK_LOG SELFHEAL_APK_FETCH_DIR \
+        SELFHEAL_PKG_BREAKS_CORE SELFHEAL_PKG_CORE_FAILS \
+        SELFHEAL_APK_FETCHED_TO SELFHEAL_APK_DEL_PURGES_NETSHIFT
     rm -rf "$work"
 }
 

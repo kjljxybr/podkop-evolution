@@ -61,6 +61,51 @@ describe('pollSingBoxComponentAction', () => {
     );
   });
 
+  it('passes a warning through on success and on failure', async () => {
+    const warned = await pollSingBoxComponentAction(
+      makeFetchStatus([
+        {
+          running: false,
+          success: true,
+          version: '1.12.4',
+          warning: 'apk world pins sing-box',
+          exit_code: 0,
+        },
+      ]),
+      noSleep,
+    );
+
+    expect(warned.success).toBe(true);
+    expect(warned.warning).toBe('apk world pins sing-box');
+
+    const failed = await pollSingBoxComponentAction(
+      makeFetchStatus([
+        {
+          running: false,
+          success: false,
+          message: 'previous binary restored',
+          warning: 'apk world pins sing-box',
+          exit_code: 1,
+        },
+      ]),
+      noSleep,
+    );
+
+    expect(failed.success).toBe(false);
+    expect(failed.warning).toBe('apk world pins sing-box');
+  });
+
+  it('reports no warning when the job state carries an empty one', async () => {
+    const result = await pollSingBoxComponentAction(
+      makeFetchStatus([
+        { running: false, success: true, version: '1.12.4', warning: '' },
+      ]),
+      noSleep,
+    );
+
+    expect(result.warning).toBeUndefined();
+  });
+
   it('treats a parse failure (null status) as terminal failure', async () => {
     const fetchStatus = makeFetchStatus([
       { running: true, success: true },

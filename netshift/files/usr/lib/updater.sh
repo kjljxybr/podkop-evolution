@@ -120,7 +120,8 @@ updates_job_status_response() {
         --arg message "$message" \
         '{success: $success, running: $running, component: "sing_box",
           action: "", message: $message, pid: null, started_at: 0,
-          updated_at: 0, exit_code: null, version: "", latest_version: ""}'
+          updated_at: 0, exit_code: null, version: "", latest_version: "",
+          warning: ""}'
 }
 
 # Returns a monotonic-ish wall clock as an integer (0 on failure).
@@ -160,7 +161,7 @@ updates_write_running_job_state() {
         '{success: true, running: true, component: $component,
           action: $action, message: "Component action is running",
           pid: $pid, started_at: $started_at, updated_at: $started_at,
-          exit_code: null, version: "", latest_version: ""}' \
+          exit_code: null, version: "", latest_version: "", warning: ""}' \
         >"$tmp_file" && mv "$tmp_file" "$state_file"
     rc=$?
 
@@ -345,9 +346,11 @@ updates_write_finished_job_state() {
 
     if updates_extract_worker_json "$output_file" "$json_file"; then
         # Worker JSON shape: {success, message?, version?, current_version?,
-        # latest_version?, status?}. Surface what is present; fall back
-        # sensibly. success also derives from a zero exit code if the worker
-        # JSON omitted it.
+        # latest_version?, status?, warning?}. Surface what is present; fall
+        # back sensibly. success also derives from a zero exit code if the
+        # worker JSON omitted it. warning is a problem the user has to act on
+        # whatever the outcome (the stable core switch reports a pin left in
+        # the apk world this way).
         jq -nc \
             --slurpfile worker "$json_file" \
             --arg component "$component" \
@@ -365,7 +368,8 @@ updates_write_finished_job_state() {
                 updated_at: $updated_at,
                 exit_code: $exit_code,
                 version: ($w.version // $w.current_version // ""),
-                latest_version: ($w.latest_version // "")}' \
+                latest_version: ($w.latest_version // ""),
+                warning: ($w.warning // "")}' \
             >"$tmp_file" && mv "$tmp_file" "$state_file"
         rc=$?
         rm -f "$tmp_file" "$json_file" "$output_file" 2>/dev/null
@@ -387,7 +391,7 @@ updates_write_finished_job_state() {
         '{success: false, running: false, component: $component,
           action: $action, message: $message, pid: null, started_at: 0,
           updated_at: $updated_at, exit_code: $exit_code, version: "",
-          latest_version: ""}' \
+          latest_version: "", warning: ""}' \
         >"$tmp_file" && mv "$tmp_file" "$state_file"
     rc=$?
 
@@ -1197,13 +1201,72 @@ updates_install_sing_box_stable() {
 # The install result is checked (no silent "|| true" that always reports
 # success), and the outcome is validated to be a NON-extended build so a failed
 # downgrade is surfaced honestly instead of masquerading as success.
+# Reads the version straight from the binary this updater manages.
+#
+# The stable path cannot gate on get_sing_box_version() (helpers.sh): that one
+# resolves `sing-box` through PATH and falls back to the literal "1.0" when the
+# binary is missing or will not run, and "1.0" is not an extended build — so a
+# router left without a core would pass every "no longer extended" check below
+# and be reported as a successful switch. Mirrors the extended path's probe,
+# including LD_LIBRARY_PATH for the side-loaded libcronet.so.
+#
+# Prints the version; returns non-zero when there is no usable core. A binary
+# that exits non-zero is not a usable core whatever it printed (a crashing build
+# can still print a usage text).
+updates_probe_sing_box_version() {
+    local output version
+
+    [ -x "$UPDATES_SING_BOX_BIN" ] || return 1
+    output="$(LD_LIBRARY_PATH=/usr/lib "$UPDATES_SING_BOX_BIN" version 2>/dev/null)" || return 1
+    version="$(printf '%s\n' "$output" | head -n1 | awk '{print $NF}')"
+    [ -n "$version" ] || return 1
+
+    printf '%s\n' "$version"
+}
+
+# True only when a runnable, non-extended core is in place. "No core at all" is
+# a failure here, not a successful downgrade.
+updates_stable_core_landed() {
+    local version
+
+    version="$(updates_probe_sing_box_version)" || return 1
+    if is_sing_box_extended "$version"; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Prints the stable path's JSON result once the package manager has run:
+# {success, <key>: <value>} plus "warning" when the apk world was left in a
+# state the user has to fix. The warning goes out on failures too: a switch
+# that was rolled back can still have changed the world. Built with jq because
+# the warning quotes world entries verbatim.
+updates_stable_result_json() {
+    local success="$1"
+    local key="$2"
+    local value="$3"
+
+    jq -nc \
+        --argjson success "$success" \
+        --arg key "$key" \
+        --arg value "$value" \
+        --arg warning "$UPDATES_APK_WORLD_WARNING" \
+        '{success: $success} + {($key): $value}
+         + (if $warning == "" then {} else {warning: $warning} end)'
+}
+
 _updates_install_sing_box_stable_core() {
-    local new_version installed=1
+    local new_version installed=1 world_entry
     local tmp_dir backup_binary="" backup_cronet=""
     local backup_binary_size="" backup_cronet_size=""
 
-    # Remove stale temp dirs from an interrupted earlier run (tmpfs is small).
-    rm -rf /tmp/netshift-sbstable.* 2>/dev/null
+    UPDATES_APK_WORLD_WARNING=""
+
+    # Remove stale temp dirs from an interrupted earlier run (tmpfs is small),
+    # including the package download directory: that one lives on flash, so a
+    # run killed mid-fetch would otherwise keep its package there for good.
+    rm -rf /tmp/netshift-sbstable.* "$UPDATES_APK_FETCH_DIR".* 2>/dev/null
 
     tmp_dir="$(mktemp -d /tmp/netshift-sbstable.XXXXXX 2>/dev/null)"
     if [ -z "$tmp_dir" ]; then
@@ -1242,13 +1305,25 @@ _updates_install_sing_box_stable_core() {
     fi
 
     if command -v apk >/dev/null 2>&1; then
+        world_entry="$(updates_apk_world_entry sing-box)"
         updates_log "Updating apk package lists"
         apk update </dev/null >/dev/null 2>&1 || true
         updates_log "Installing stable sing-box via apk"
-        if ! apk add --allow-downgrade sing-box </dev/null >/dev/null 2>&1; then
-            # apk fix is a best-effort recovery; its result still decides success.
-            apk fix sing-box </dev/null >/dev/null 2>&1 || installed=0
+        # apk-tools 3 has no --allow-downgrade. `apk fix --reinstall` rewrites the
+        # package files in place, but when the installed build is no longer in
+        # the feed index (the feed was rebuilt since) it skips the package and
+        # still exits 0 ("[APK unavailable, skipped]"). So check that the core
+        # actually changed, and fall back to the package file from the feed.
+        if ! apk fix --reinstall sing-box </dev/null >/dev/null 2>&1 ||
+            ! updates_stable_core_landed; then
+            updates_apk_reinstall_sing_box_from_file "$tmp_dir" || installed=0
         fi
+        # Whichever route the install took, and whether it landed or not, the
+        # world must not be left pinning a build. Problems here are reported
+        # through UPDATES_APK_WORLD_WARNING and do not decide whether the core
+        # switched: the checks below do, including the case where the fixup's
+        # `apk del` took the core with it.
+        updates_apk_settle_sing_box_world "$world_entry"
     elif command -v opkg >/dev/null 2>&1; then
         updates_log "Updating opkg package lists"
         opkg update </dev/null >/dev/null 2>&1 || true
@@ -1269,21 +1344,26 @@ _updates_install_sing_box_stable_core() {
         updates_stable_rollback "$backup_binary" "$backup_cronet" "$backup_binary_size" "$backup_cronet_size"
         rm -rf "$tmp_dir"
         updates_log "Failed to install stable sing-box via package manager; previous binary restored" "error"
-        echo "{\"success\":false,\"message\":\"Failed to install stable sing-box (package manager error); previous binary restored\"}"
+        updates_stable_result_json false message "Failed to install stable sing-box (package manager error); previous binary restored"
         return 1
     fi
 
-    updates_restart_netshift
-    new_version="$(get_sing_box_version)"
-
-    # Validate the rollback actually took effect: the running binary must no
-    # longer be an "extended" build. If it still is, the install did not land —
-    # restore the backup so the router keeps a known-good core.
+    # Validate the switch before restarting anything: there must be a runnable
+    # binary and it must no longer be an "extended" build. If the install did not
+    # land — restore the backup and leave the running NetShift alone.
+    new_version="$(updates_probe_sing_box_version || true)"
+    if [ -z "$new_version" ]; then
+        updates_stable_rollback "$backup_binary" "$backup_cronet" "$backup_binary_size" "$backup_cronet_size"
+        rm -rf "$tmp_dir"
+        updates_log "Stable install reported success but no runnable sing-box is in place; previous binary restored" "error"
+        updates_stable_result_json false message "No runnable sing-box after the install (previous binary restored)"
+        return 1
+    fi
     if is_sing_box_extended "$new_version"; then
         updates_stable_rollback "$backup_binary" "$backup_cronet" "$backup_binary_size" "$backup_cronet_size"
         rm -rf "$tmp_dir"
         updates_log "Stable install reported success but sing-box is still extended ($new_version); previous binary restored" "error"
-        echo "{\"success\":false,\"message\":\"sing-box is still the extended build after install; rollback did not take effect (previous binary restored)\"}"
+        updates_stable_result_json false message "sing-box is still the extended build after install; rollback did not take effect (previous binary restored)"
         return 1
     fi
 
@@ -1294,11 +1374,154 @@ _updates_install_sing_box_stable_core() {
         rm -f "$UPDATES_LIBCRONET_LIB" 2>/dev/null || true
     fi
 
-    # Drop the backup only now that the install is confirmed good.
+    # Drop the backup only now that the install is confirmed good, and before
+    # the restart regenerates and checks the sing-box config: the backup is a
+    # full copy of the extended binary held in RAM (tmpfs).
     rm -rf "$tmp_dir"
+    updates_restart_netshift
     updates_log "Stable sing-box installed: ${new_version:-unknown}"
-    echo "{\"success\":true,\"version\":\"$new_version\"}"
+    # A world warning does not make this a failed install: the core did switch.
+    # It still has to reach the user, not just the log.
+    updates_stable_result_json true version "$new_version"
     return 0
+}
+
+# Prints the apk world entry for package $1 exactly as it is written in the
+# world file, or nothing when the package is not a world member. Covers every
+# constraint form apk accepts — bare name, "name=1.2-r1", "name><Q1...",
+# "name@tag", "!name" — because an entry that is not recognised here ends up
+# treated as "sing-box was not in the world" and silently dropped.
+# $1 is used as part of a regex, so call it with literal package names only.
+updates_apk_world_entry() {
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$UPDATES_APK_WORLD" 2>/dev/null |
+        grep -E "^!?$1([@<>=~].*)?$" | head -n1
+}
+
+# Records a problem with the apk world for the stable path's JSON result.
+updates_apk_world_warn() {
+    UPDATES_APK_WORLD_WARNING="$1"
+    updates_log "$1" "error"
+}
+
+# Leaves the sing-box entry of the apk world as it was before the switch, minus
+# any build-hash pin ("sing-box><Q1...").
+#
+# Installing a package file pins its build hash, and that pin then silently
+# blocks every later `apk upgrade sing-box`. NetShift's installer never writes
+# one for sing-box (the core comes in as a dependency), so a hash pin that is
+# already there before the switch is a leftover of an earlier run that could not
+# drop it (see below), and it is not an entry to keep either. An entry that
+# cannot be put back — a version pin such as "sing-box=1.13.21-r1" is rejected
+# as soon as the feed moved on ("breaks: world[sing-box=1.13.21-r1]") — is
+# reported, but the hash pin still goes.
+#
+# `apk del sing-box` is the only way to drop an entry, and it also removes
+# reverse dependencies that are not world members themselves: on a router where
+# `netshift` is not in the world, it purges NetShift along with the package. So
+# the del is attempted only while NetShift is a world member, plain or pinned;
+# "!netshift" is an exclusion, not a member.
+#
+# Never undoes the core switch: every problem is reported through
+# UPDATES_APK_WORLD_WARNING, which the caller puts into its JSON result. Returns
+# 0 when the world ended up as intended.
+updates_apk_settle_sing_box_world() {
+    local target="$1"
+    local current
+
+    case "$target" in
+    'sing-box><'*) target="" ;;
+    esac
+
+    current="$(updates_apk_world_entry sing-box)"
+    if [ "$current" = "$target" ]; then
+        return 0
+    fi
+
+    case "$(updates_apk_world_entry netshift)" in
+    "" | '!'*)
+        updates_apk_world_warn "apk world pins sing-box as '${current:-none}'; the pin was left in place because 'netshift' is not a world entry and 'apk del sing-box' would remove NetShift with it. Drop the pin from $UPDATES_APK_WORLD by hand to let 'apk upgrade' update the core again."
+        return 1
+        ;;
+    esac
+
+    if ! apk del sing-box </dev/null >/dev/null 2>&1; then
+        updates_apk_world_warn "Failed to drop the sing-box entry '${current:-none}' from $UPDATES_APK_WORLD; 'apk upgrade' will not update the core until it is removed."
+        return 1
+    fi
+    if [ ! -x /etc/init.d/netshift ]; then
+        updates_apk_world_warn "'apk del sing-box' removed the NetShift package although 'netshift' is a world entry; reinstall NetShift."
+        return 1
+    fi
+
+    if [ -n "$target" ] && ! apk add "$target" </dev/null >/dev/null 2>&1; then
+        updates_apk_world_warn "apk refused to restore the sing-box world entry '$target' (e.g. the feed no longer has that version); the build pin was dropped, put the entry back by hand if pinning matters."
+        return 1
+    fi
+
+    current="$(updates_apk_world_entry sing-box)"
+    if [ "$current" != "$target" ]; then
+        updates_apk_world_warn "apk world entry for sing-box is '${current:-none}' instead of '${target:-none}'; restore it by hand if upgrades or pinning matter."
+        return 1
+    fi
+
+    return 0
+}
+
+# Reinstalls sing-box from its package file in the configured feeds, for when
+# `apk fix --reinstall` skips it. The hash pin this leaves in the world is
+# dropped by the caller (updates_apk_settle_sing_box_world).
+#
+# `apk fetch` verifies the downloaded file against the signed feed index
+# (apk_extract_verify_identity), so --allow-untrusted on the install does not
+# weaken anything: feed packages carry no signature of their own, and without
+# the flag apk refuses the file outright. --force-reinstall is kept because the
+# extended core is side-loaded OVER the feed package's files: apk still records
+# that exact build as installed, so an install of the very same build is the
+# case the flag exists for. It is an OpenWrt patch on apk-tools 3 and is present
+# on the target.
+#
+# Returns non-zero when the package did not install; the caller then restores
+# the backup.
+updates_apk_reinstall_sing_box_from_file() {
+    local tmp_dir="$1"
+    local fetch_dir pkg="" rc=0
+
+    # Keep the package out of the tmpfs that already holds the backup of the
+    # extended core (~90 MB): on a 240 MB-RAM router the two together are an
+    # ENOSPC away from failing the fetch, i.e. from failing exactly where the
+    # rollback safety net is all that is left. The download goes to the flash
+    # the binary lives on instead, which is not free either: the overlay can be
+    # small (see the disk-space note on the extended path), and the package
+    # needs room there on top of the binary apk unpacks from it. When it does
+    # not fit, the fetch or the install fails and the caller restores the
+    # backup, so the router keeps a working core either way. Falls back to tmpfs
+    # only when that directory cannot be created.
+    fetch_dir="$(mktemp -d "$UPDATES_APK_FETCH_DIR.XXXXXX" 2>/dev/null)"
+    [ -n "$fetch_dir" ] || fetch_dir="$(mktemp -d "$tmp_dir/apk-fetch.XXXXXX" 2>/dev/null)"
+    if [ -z "$fetch_dir" ]; then
+        updates_log "Failed to create a directory for the sing-box package download" "error"
+        return 1
+    fi
+
+    if ! apk fetch sing-box -o "$fetch_dir" </dev/null >/dev/null 2>&1; then
+        rm -rf "$fetch_dir"
+        updates_log "Failed to fetch the stable sing-box package from the feeds" "error"
+        return 1
+    fi
+    for pkg in "$fetch_dir"/sing-box-*.apk; do
+        break
+    done
+    if [ ! -f "$pkg" ]; then
+        rm -rf "$fetch_dir"
+        updates_log "apk fetch left no sing-box package file behind" "error"
+        return 1
+    fi
+
+    updates_log "Installing stable sing-box from the feed package file"
+    apk add --allow-untrusted --force-reinstall "$pkg" </dev/null >/dev/null 2>&1 || rc=1
+    rm -rf "$fetch_dir"
+
+    return "$rc"
 }
 
 # Restores the tmpfs backup of /usr/bin/sing-box (and libcronet.so) into place.
