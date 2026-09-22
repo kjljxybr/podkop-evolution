@@ -33,6 +33,14 @@ SING_BOX_RELOAD_SETTLE_DELAY="3"
 # Exit code of `netshift subscription_update` when the feeds were downloaded but
 # applying them failed (the pending-apply marker stays for the next run).
 SUBSCRIPTION_UPDATE_APPLY_FAILED=3
+# Interval a subscription section runs on when its own
+# `subscription_update_interval` says nothing usable: the option is absent (an
+# old conffile), or it holds a value the cron table does not know (a hand-edited
+# UCI option such as "2h"). An unknown value must NOT drop the section out of
+# every cron job — that silently stops refreshing it — so it is treated as this
+# default. Both the cron collector and the `subscription_update <interval>`
+# section filter read this constant, so the two cannot drift apart silently.
+SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT="1h"
 # Deferred startup subscription refresh (start_subscription_startup_retry_worker):
 # a feed that is unreachable is retried every SUBSCRIPTION_RETRY_INTERVAL
 # seconds for as long as it takes. A feed that downloads but does not apply is

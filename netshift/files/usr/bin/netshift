@@ -932,7 +932,7 @@ start_main() {
     # process first, and the marker then stays for the next subscription_update.
     rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
     config_foreach add_cron_job "section"
-    config_foreach add_subscription_cron_job "section"
+    sync_subscription_cron_jobs
     /etc/init.d/sing-box start
 
     if [ "$subscription_startup_blocked" -ne 0 ]; then
@@ -1791,53 +1791,96 @@ remove_cron_job() {
     log "The cron job removed"
 }
 
-add_subscription_cron_job() {
-    local section="$1"
-    local connection_type proxy_config_type subscription_update_interval cron_job
-
-    config_get connection_type "$section" "connection_type"
-    if [ "$connection_type" != "proxy" ]; then
-        return
-    fi
-
-    config_get proxy_config_type "$section" "proxy_config_type"
-    if [ "$proxy_config_type" != "subscription" ]; then
-        return
-    fi
-
-    config_get subscription_update_interval "$section" "subscription_update_interval" "1h"
-
-    case "$subscription_update_interval" in
+# The cron line that updates the sections carrying a given
+# subscription_update_interval, or a failure status for an unknown value.
+#
+# The jobs use DIFFERENT minutes on purpose: two jobs firing in the same minute
+# would run two subscription_update processes side by side, and those race on the
+# pending-apply marker and on the sing-box rebuild + reload. The hourly job keeps
+# the :17 it always had.
+get_subscription_cron_line_for_interval() {
+    case "$1" in
     "30m")
-        cron_job="*/30 * * * * /usr/bin/netshift subscription_update"
+        echo "*/30 * * * * /usr/bin/netshift subscription_update 30m"
         ;;
     "1h")
-        cron_job="17 * * * * /usr/bin/netshift subscription_update"
+        echo "17 * * * * /usr/bin/netshift subscription_update 1h"
         ;;
     "3h")
-        cron_job="17 */3 * * * /usr/bin/netshift subscription_update"
+        echo "7 */3 * * * /usr/bin/netshift subscription_update 3h"
         ;;
     "6h")
-        cron_job="17 */6 * * * /usr/bin/netshift subscription_update"
+        echo "24 */6 * * * /usr/bin/netshift subscription_update 6h"
         ;;
     "12h")
-        cron_job="17 */12 * * * /usr/bin/netshift subscription_update"
+        echo "40 */12 * * * /usr/bin/netshift subscription_update 12h"
         ;;
     "1d")
-        cron_job="17 9 * * * /usr/bin/netshift subscription_update"
+        echo "52 9 * * * /usr/bin/netshift subscription_update 1d"
         ;;
     *)
-        log "Invalid subscription_update_interval value: $subscription_update_interval"
-        return
+        return 1
         ;;
     esac
+}
 
-    # Avoid duplicate subscription cron
-    (crontab -l | grep -v "/usr/bin/netshift subscription_update") | {
-        cat
-        echo "$cron_job"
-    } | crontab -
-    log "The subscription cron job has been created: $cron_job"
+# config_foreach callback collecting the DISTINCT subscription_update_interval
+# values into SUBSCRIPTION_UPDATE_INTERVALS (space separated). One cron job is
+# created per distinct value, so every section is updated on the interval its own
+# option asks for no matter where it sits in the UCI order — the bug was a single
+# job built from whichever section came last, which then drove every section on
+# that one interval.
+#
+# An unknown value falls back to SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT (warned
+# about) instead of being dropped: a section left out of every job would simply
+# stop being refreshed, which is what the pre-#51 single interval-less job did
+# not do. The absent option takes the same default, so an upgrade keeps its
+# previous hourly refresh.
+_collect_subscription_update_interval() {
+    local section="$1"
+    local connection_type proxy_config_type subscription_update_interval
+
+    config_get connection_type "$section" "connection_type"
+    [ "$connection_type" = "proxy" ] || return 0
+
+    config_get proxy_config_type "$section" "proxy_config_type"
+    [ "$proxy_config_type" = "subscription" ] || return 0
+
+    config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+    if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null; then
+        log "Unknown subscription_update_interval '$subscription_update_interval' in section '$section', using $SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT" "warn"
+        subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+    fi
+
+    SUBSCRIPTION_UPDATE_INTERVALS="$SUBSCRIPTION_UPDATE_INTERVALS $subscription_update_interval"
+}
+
+# Rebuild the subscription cron jobs from the current config: one job per
+# distinct interval, each updating only the sections carrying it
+# (`subscription_update <interval>`). The jobs are rebuilt from scratch so none
+# of them can outlive the interval that asked for it — which also drops the
+# legacy single job (`/usr/bin/netshift subscription_update`, no interval) that
+# an upgrade leaves in crontab and that used to drive every section.
+sync_subscription_cron_jobs() {
+    local subscription_update_interval cron_job
+
+    SUBSCRIPTION_UPDATE_INTERVALS=""
+    config_foreach _collect_subscription_update_interval "section"
+
+    (crontab -l | grep -v "/usr/bin/netshift subscription_update") | crontab -
+
+    # Sorted and deduplicated: sections sharing an interval share one job, and
+    # the resulting crontab does not depend on the order the sections happen to
+    # be stored in.
+    for subscription_update_interval in $(printf '%s\n' $SUBSCRIPTION_UPDATE_INTERVALS | sort -u); do
+        cron_job="$(get_subscription_cron_line_for_interval "$subscription_update_interval")"
+
+        crontab -l | {
+            cat
+            echo "$cron_job"
+        } | crontab -
+        log "The subscription cron job has been created: $cron_job"
+    done
 }
 ensure_nft_ready_for_list_update() {
     if nft list table inet "$NFT_TABLE_NAME" > /dev/null 2>&1; then
@@ -2044,28 +2087,62 @@ reload_sing_box_config_in_place() {
     echolog "🔄 sing-box reloaded the updated config without a netshift restart"
 }
 
+# Updates every subscription section, or — with an argument — only the sections
+# whose subscription_update_interval is that value. The cron jobs run one per
+# distinct interval and pass theirs, so a section is refreshed on the schedule
+# its own option asks for regardless of the UCI order.
+#
+# An argument the cron table does not know is not a filter that matches nothing:
+# `netshift subscription_update 2h` used to update no section at all and still
+# exit 0. Such a call refreshes every section instead (and says so), so a typo on
+# the command line, or a cron line carrying an interval this version no longer
+# schedules, cannot silently stop refreshing the subscriptions.
 subscription_update() {
     echolog "🔄 Starting subscription update..."
 
+    local target_interval="${1:-}"
     local has_subscription=0
     local updated_sections=0
     local failed_sections=0
     local pending_apply=0
     local apply_rc=0
 
-    _check_subscription_section() {
+    if [ -n "$target_interval" ] && ! get_subscription_cron_line_for_interval "$target_interval" > /dev/null; then
+        echolog "⚠️ Unknown subscription update interval '$target_interval', updating every subscription section" "warn"
+        target_interval=""
+    fi
+
+    # True when the section takes part in this run: a subscription section, and
+    # carrying the requested interval when the caller named one.
+    _subscription_section_selected() {
         local section="$1"
-        local connection_type proxy_config_type
+        local connection_type proxy_config_type subscription_update_interval
 
         config_get connection_type "$section" "connection_type"
-        if [ "$connection_type" != "proxy" ]; then
-            return
-        fi
+        [ "$connection_type" = "proxy" ] || return 1
 
         config_get proxy_config_type "$section" "proxy_config_type"
-        if [ "$proxy_config_type" = "subscription" ]; then
-            has_subscription=1
+        [ "$proxy_config_type" = "subscription" ] || return 1
+
+        if [ -n "$target_interval" ]; then
+            config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            # The same fallback the cron collector applies: a section whose stored
+            # value is unknown runs on the default, so the job built for the
+            # default is the job that updates it.
+            if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null; then
+                subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            fi
+            [ "$subscription_update_interval" = "$target_interval" ] || return 1
         fi
+
+        return 0
+    }
+
+    _check_subscription_section() {
+        local section="$1"
+
+        _subscription_section_selected "$section" || return
+        has_subscription=1
     }
     config_foreach _check_subscription_section "section"
 
@@ -2076,20 +2153,11 @@ subscription_update() {
 
     _update_subscription_for_section() {
         local section="$1"
-        local connection_type proxy_config_type url urlhash subscription_json_path
+        local url urlhash subscription_json_path
         local subscription_url_cache_path service_proxy_address update_result outbounds_count
         local urls_tmp url_count section_changed feed_usable_count feed_failed_count
 
-        config_get connection_type "$section" "connection_type"
-        if [ "$connection_type" != "proxy" ]; then
-            return
-        fi
-
-
-        config_get proxy_config_type "$section" "proxy_config_type"
-        if [ "$proxy_config_type" != "subscription" ]; then
-            return
-        fi
+        _subscription_section_selected "$section" || return
 
         mkdir -p "$TMP_SUBSCRIPTION_FOLDER"
         if ! ensure_subscription_cache_dir; then
@@ -5440,7 +5508,9 @@ Available commands:
     restart                 Restart NetShift service
     main                    Run main NetShift process
     list_update             Update domain lists
-    subscription_update     Update subscription proxies
+    subscription_update     Update subscription proxies; with an interval
+                            (30m|1h|3h|6h|12h|1d) only the sections using it,
+                            an unknown interval updates every section
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -5495,7 +5565,7 @@ list_update)
     list_update
     ;;
 subscription_update)
-    subscription_update
+    subscription_update "${2:-}"
     ;;
 check_proxy)
     check_proxy

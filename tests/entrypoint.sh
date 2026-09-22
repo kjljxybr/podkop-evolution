@@ -6726,6 +6726,593 @@ SUBOPTEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: per-section subscription auto-update interval (issue #51)
+#
+# The cron job used to be built from whichever subscription section came last in
+# UCI order and then drove EVERY section on that one interval. One job per
+# distinct interval is created now, each updating only the sections carrying it,
+# so a section's own option decides its schedule wherever it sits in the config.
+# ─────────────────────────────────────────────────────────────────
+test_sub_cron() {
+    header "Per-section subscription update interval (issue #51)"
+
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    if [ ! -r "$bin" ]; then
+        skip "subcron — bin/netshift not found"
+        return
+    fi
+    if [ ! -r /lib/functions.sh ]; then
+        skip "subcron — LuCI config_load not available"
+        return
+    fi
+
+    local lib="${NETSHIFT_LIB_DIR}"
+    local drv="/tmp/netshift-subcron-$$.sh"
+    cat > "$drv" << 'SUBCRONEOF'
+BIN="BIN_PATH_PLACEHOLDER"
+LIB="LIB_DIR_PLACEHOLDER"
+. /lib/functions.sh
+# shellcheck disable=SC1090
+. "$LIB/constants.sh"
+
+extract() {
+    awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "$BIN"
+}
+
+WORK="/tmp/netshift-subcron-work-$$"
+rm -rf "$WORK"
+mkdir -p "$WORK"
+CRONTAB_FILE="$WORK/crontab"
+: > "$CRONTAB_FILE"
+
+# The log is a file: the shipped code is expected to SAY that it fell back to
+# the default interval, so a silent fallback has to be visible here.
+LOG_FILE="$WORK/log"
+: > "$LOG_FILE"
+log() { printf '[%s] %s\n' "${2:-info}" "$1" >> "$LOG_FILE"; }
+nolog() { :; }
+echolog() { log "$1" "${2:-info}"; }
+
+# A crontab that is a file, so the shipped code is exercised verbatim without
+# touching the container's real one. The write goes through a temp file + mv,
+# exactly like busybox crontab: a plain `cat > $file` would truncate the file
+# while the `crontab -l` of the same pipeline is still reading it, and the
+# appended jobs would silently vanish.
+crontab() {
+    case "$1" in
+    -l)
+        [ -f "$CRONTAB_FILE" ] && cat "$CRONTAB_FILE"
+        return 0
+        ;;
+    -)
+        cat > "$CRONTAB_FILE.new" || return 1
+        mv "$CRONTAB_FILE.new" "$CRONTAB_FILE"
+        ;;
+    esac
+}
+
+for fn in get_subscription_cron_line_for_interval \
+          _collect_subscription_update_interval \
+          sync_subscription_cron_jobs \
+          remove_cron_job \
+          subscription_update; do
+    eval "$(extract "$fn")"
+done
+
+has_line() { grep -qxF "$1" "$CRONTAB_FILE"; }
+job_count() { grep -c "/usr/bin/netshift subscription_update" "$CRONTAB_FILE"; }
+# $1 = fixture, $2 = "keep" to keep the crontab as it is (upgrade simulation).
+sync() {
+    cp "$1" /etc/config/nsfixture
+    config_load nsfixture
+    [ "$2" = "keep" ] || : > "$CRONTAB_FILE"
+    sync_subscription_cron_jobs
+    rm -f /etc/config/nsfixture
+}
+
+# ── Every interval has its own schedule, and only the known ones ──
+for spec in "30m|*/30 * * * *" "1h|17 * * * *" "3h|7 */3 * * *" "6h|24 */6 * * *" "12h|40 */12 * * *" "1d|52 9 * * *"; do
+    iv="${spec%%|*}"
+    want="${spec#*|}"
+    got="$(get_subscription_cron_line_for_interval "$iv")"
+    if [ "$got" = "$want /usr/bin/netshift subscription_update $iv" ]; then
+        echo "subcron:schedule-$iv:OK"
+    else
+        echo "subcron:schedule-$iv:FAIL [got '$got']"
+    fi
+done
+# The fallback for an unknown value is the default interval, so a value the
+# mapper does not know must not silently map to a job.
+if get_subscription_cron_line_for_interval 2h > /dev/null 2>&1; then
+    echo 'subcron:schedule-unknown-rejected:FAIL [2h accepted]'
+else
+    echo 'subcron:schedule-unknown-rejected:OK'
+fi
+if get_subscription_cron_line_for_interval '' > /dev/null 2>&1; then
+    echo 'subcron:schedule-empty-rejected:FAIL [empty accepted]'
+else
+    echo 'subcron:schedule-empty-rejected:OK'
+fi
+
+# ── The jobs never share a minute ─────────────────────────────────
+# Two jobs firing in the same minute would run two subscription_update processes
+# side by side, and those race on the pending-apply marker and on the sing-box
+# rebuild + reload. `*/30` fires at :00 and :30, so the fixed minutes must avoid
+# both of them as well.
+fired=""
+collision=""
+for iv in 30m 1h 3h 6h 12h 1d; do
+    minute="$(get_subscription_cron_line_for_interval "$iv" | cut -d' ' -f1)"
+    if [ "$minute" = "*/30" ]; then
+        minutes="0 30"
+    else
+        minutes="$minute"
+    fi
+    for m in $minutes; do
+        case " $fired " in
+        *" $m "*) collision="$collision $iv@$m" ;;
+        esac
+        fired="$fired $m"
+    done
+done
+if [ -z "$collision" ]; then
+    echo 'subcron:distinct-minutes:OK'
+else
+    echo "subcron:distinct-minutes:FAIL [collision:$collision]"
+fi
+
+# ── Fixtures ───────────────────────────────────────────────────
+cat > "$WORK/fast_slow" <<'CFGEOF'
+config section 'fast'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/fast'
+        option subscription_update_interval '30m'
+
+config section 'slow'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/slow'
+        option subscription_update_interval '1d'
+CFGEOF
+cat > "$WORK/slow_fast" <<'CFGEOF'
+config section 'slow'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/slow'
+        option subscription_update_interval '1d'
+
+config section 'fast'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/fast'
+        option subscription_update_interval '30m'
+CFGEOF
+# Upgrade simulation: a config written before subscription_update_interval
+# existed — the option is simply absent (the package keeps the old conffile).
+cat > "$WORK/no_interval" <<'CFGEOF'
+config section 'one'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/one'
+
+config section 'two'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/two'
+CFGEOF
+# Two sections sharing one interval must share ONE job.
+cat > "$WORK/same_interval" <<'CFGEOF'
+config section 'a'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/a'
+        option subscription_update_interval '1h'
+
+config section 'b'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/b'
+        option subscription_update_interval '1h'
+CFGEOF
+cat > "$WORK/no_subscription" <<'CFGEOF'
+config section 'plain'
+        option connection_type 'proxy'
+        option proxy_config_type 'url'
+        option proxy_string 'vless://node'
+CFGEOF
+# A hand-edited interval the UI never offers. Such a section used to be dropped
+# from every job and stopped being refreshed; it must run on the default instead.
+cat > "$WORK/invalid_only" <<'CFGEOF'
+config section 'hand'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/hand'
+        option subscription_update_interval '2h'
+CFGEOF
+# ... and it shares the default job with the sections that really ask for it,
+# without disturbing a section on another interval.
+cat > "$WORK/invalid_and_known" <<'CFGEOF'
+config section 'hourly'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/hourly'
+        option subscription_update_interval '1h'
+
+config section 'hand'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/hand'
+        option subscription_update_interval '2h'
+
+config section 'fast'
+        option connection_type 'proxy'
+        option proxy_config_type 'subscription'
+        option subscription_url 'https://example.com/fast'
+        option subscription_update_interval '30m'
+CFGEOF
+
+# ── Two sections, two intervals, independent of the UCI order ───
+sync "$WORK/fast_slow"
+if has_line "*/30 * * * * /usr/bin/netshift subscription_update 30m"; then
+    echo 'subcron:fast-keeps-30m:OK'
+else
+    echo "subcron:fast-keeps-30m:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+if has_line "52 9 * * * /usr/bin/netshift subscription_update 1d"; then
+    echo 'subcron:slow-keeps-1d:OK'
+else
+    echo "subcron:slow-keeps-1d:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+if [ "$(job_count)" = "2" ]; then
+    echo 'subcron:one-job-per-interval:OK'
+else
+    echo "subcron:one-job-per-interval:FAIL [$(job_count)]"
+fi
+first_crontab="$(cat "$CRONTAB_FILE")"
+
+sync "$WORK/slow_fast"
+if [ "$(cat "$CRONTAB_FILE")" = "$first_crontab" ]; then
+    echo 'subcron:order-independent:OK'
+else
+    echo "subcron:order-independent:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+# No job may be left without an interval: a bare one updates every section on
+# one interval, which is the bug being fixed.
+if has_line "17 * * * * /usr/bin/netshift subscription_update"; then
+    echo 'subcron:no-interval-less-job:FAIL [bare job present]'
+else
+    echo 'subcron:no-interval-less-job:OK'
+fi
+
+# ── Upgrade: the legacy interval-less job is replaced, list_update survives ──
+cat > "$CRONTAB_FILE" <<'CRONEOF'
+13 9 * * * /usr/bin/netshift list_update
+17 9 * * * /usr/bin/netshift subscription_update
+CRONEOF
+sync "$WORK/fast_slow" keep
+if grep -qxF "17 9 * * * /usr/bin/netshift subscription_update" "$CRONTAB_FILE"; then
+    echo 'subcron:legacy-job-dropped:FAIL [bare job still there]'
+else
+    echo 'subcron:legacy-job-dropped:OK'
+fi
+if has_line "13 9 * * * /usr/bin/netshift list_update"; then
+    echo 'subcron:list-update-job-kept:OK'
+else
+    echo 'subcron:list-update-job-kept:FAIL'
+fi
+if [ "$(job_count)" = "2" ]; then
+    echo 'subcron:legacy-replaced-by-intervals:OK'
+else
+    echo "subcron:legacy-replaced-by-intervals:FAIL [$(job_count)]"
+fi
+
+# ── Upgrade simulation: the option is absent (old conffile) ─────
+sync "$WORK/no_interval"
+if has_line "17 * * * * /usr/bin/netshift subscription_update 1h"; then
+    echo 'subcron:missing-option-uses-default:OK'
+else
+    echo "subcron:missing-option-uses-default:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+if [ "$(job_count)" = "1" ]; then
+    echo 'subcron:missing-option-single-job:OK'
+else
+    echo "subcron:missing-option-single-job:FAIL [$(job_count)]"
+fi
+
+# ── Two sections sharing an interval share one job ──────────────
+sync "$WORK/same_interval"
+if [ "$(job_count)" = "1" ] && has_line "17 * * * * /usr/bin/netshift subscription_update 1h"; then
+    echo 'subcron:shared-interval-deduped:OK'
+else
+    echo "subcron:shared-interval-deduped:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+
+# ── Re-running adds nothing (the jobs are rebuilt, not appended) ──
+sync "$WORK/same_interval"
+sync "$WORK/same_interval" keep
+sync "$WORK/same_interval" keep
+if [ "$(job_count)" = "1" ]; then
+    echo 'subcron:idempotent:OK'
+else
+    echo "subcron:idempotent:FAIL [$(job_count)]"
+fi
+
+# ── A section without a usable interval must never lose its job ──
+# Regression (issue #51): an unknown value used to be logged and skipped, so the
+# section was left out of EVERY job and stopped being refreshed. It runs on the
+# default interval now, i.e. the section lands in the 1h job.
+: > "$LOG_FILE"
+sync "$WORK/invalid_only"
+if has_line "17 * * * * /usr/bin/netshift subscription_update 1h"; then
+    echo 'subcron:unknown-interval-falls-back-to-default:OK'
+else
+    echo "subcron:unknown-interval-falls-back-to-default:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+if [ "$(job_count)" = "1" ]; then
+    echo 'subcron:unknown-interval-one-job:OK'
+else
+    echo "subcron:unknown-interval-one-job:FAIL [$(job_count)]"
+fi
+if grep -q "2h" "$CRONTAB_FILE"; then
+    echo "subcron:unknown-interval-not-scheduled:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+else
+    echo 'subcron:unknown-interval-not-scheduled:OK'
+fi
+# The fallback is only acceptable if it is visible: a warning naming the section
+# and the value it is replacing.
+if grep -q "^\[warn\] Unknown subscription_update_interval '2h' in section 'hand'" "$LOG_FILE"; then
+    echo 'subcron:unknown-interval-warned:OK'
+else
+    echo "subcron:unknown-interval-warned:FAIL [$(tr '\n' ';' < "$LOG_FILE")]"
+fi
+# ... and the known intervals are not warned about at all.
+: > "$LOG_FILE"
+sync "$WORK/fast_slow"
+if grep -q "Unknown subscription_update_interval" "$LOG_FILE"; then
+    echo "subcron:known-interval-not-warned:FAIL [$(tr '\n' ';' < "$LOG_FILE")]"
+else
+    echo 'subcron:known-interval-not-warned:OK'
+fi
+
+# A section asking for the default and one carrying an unknown value share that
+# one job, and the section on another interval keeps its own: the unknown value
+# must neither add a schedule of its own nor swallow the other one.
+sync "$WORK/invalid_and_known"
+if [ "$(job_count)" = "2" ] && has_line "17 * * * * /usr/bin/netshift subscription_update 1h" &&
+    has_line "*/30 * * * * /usr/bin/netshift subscription_update 30m"; then
+    echo 'subcron:unknown-interval-shares-default-job:OK'
+else
+    echo "subcron:unknown-interval-shares-default-job:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+
+# ── Non-subscription sections get no job at all ─────────────────
+sync "$WORK/no_subscription"
+if [ "$(job_count)" = "0" ]; then
+    echo 'subcron:no-subscription-no-job:OK'
+else
+    echo "subcron:no-subscription-no-job:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+
+# ── remove_cron_job clears the legacy bare job and the interval jobs ──
+# stop_main calls it, and the interval jobs are matched by the same
+# `/usr/bin/netshift subscription_update` substring as the old interval-less one.
+cat > "$CRONTAB_FILE" <<'CRONEOF'
+13 9 * * * /usr/bin/netshift list_update
+17 9 * * * /usr/bin/netshift subscription_update
+17 * * * * /usr/bin/netshift subscription_update 1h
+52 9 * * * /usr/bin/netshift subscription_update 1d
+4 4 * * * /usr/bin/netshift check_proxy
+CRONEOF
+remove_cron_job
+if [ "$(job_count)" = "0" ] &&
+    ! grep -q "/usr/bin/netshift list_update" "$CRONTAB_FILE" &&
+    has_line "4 4 * * * /usr/bin/netshift check_proxy"; then
+    echo 'subcron:remove-cron-job-clears-all:OK'
+else
+    echo "subcron:remove-cron-job-clears-all:FAIL [$(tr '\n' ';' < "$CRONTAB_FILE")]"
+fi
+
+# ── start_main (re)builds the jobs ───────────────────────────────
+# The wiring, not the builder: start_main must call sync_subscription_cron_jobs.
+# The hot-reload test only counts the calls to a stub, so here the REAL builder
+# runs against a loaded config and the resulting crontab is checked.
+eval "$(extract start_main | sed \
+    -e 's|/usr/sbin/ntpd|: ntpd|' \
+    -e 's|/etc/init.d/sing-box start|subcron_sing_box_start|' \
+    -e 's|^    sleep 1$|    :|' \
+    -e 's|/var/run/netshift_list_update.pid|$WORK/list_update.pid|')"
+subcron_sing_box_start() { :; }
+migrate_legacy_subscription_url_option() { :; }
+check_requirements() { :; }
+migration() { :; }
+process_validate_service() { :; }
+br_netfilter_disable() { :; }
+ensure_subscription_cache_dir() { :; }
+migrate_subscription_cache_from_tmp() { :; }
+prepare_subscription_caches_for_startup() { subscription_startup_blocked=0; }
+stop_subscription_startup_retry_worker() { :; }
+route_table_rule_mark() { :; }
+create_nft_rules() { :; }
+sing_box_configure_service() { :; }
+sing_box_init_config() { :; }
+add_cron_job() { :; }
+list_update() { :; }
+TMP_SING_BOX_FOLDER="$WORK/sing-box"
+TMP_RULESET_FOLDER="$WORK/rulesets"
+TMP_SUBSCRIPTION_FOLDER="$WORK/sub-tmp"
+
+cp "$WORK/fast_slow" /etc/config/nsfixture
+config_load nsfixture
+: > "$CRONTAB_FILE"
+rm -f "$WORK/list_update.pid"
+mkdir -p "$(dirname "$SUBSCRIPTION_PENDING_APPLY_FLAG")"
+: > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+( start_main ) > /dev/null 2>&1
+rc=$?
+rm -f /etc/config/nsfixture
+if [ "$rc" -eq 0 ] && [ "$(job_count)" = "2" ] &&
+    has_line "52 9 * * * /usr/bin/netshift subscription_update 1d" &&
+    has_line "*/30 * * * * /usr/bin/netshift subscription_update 30m"; then
+    echo 'subcron:start-main-builds-jobs:OK'
+else
+    echo "subcron:start-main-builds-jobs(rc=$rc jobs=$(job_count) crontab=$(tr '\n' ';' < "$CRONTAB_FILE")):FAIL"
+fi
+# ... and the call sits where the built config has already been accepted: the
+# marker is dropped and the pidfile of the backgrounded list_update is written,
+# so the run above really went through the whole function.
+if [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ -f "$WORK/list_update.pid" ]; then
+    echo 'subcron:start-main-ran-through:OK'
+else
+    echo 'subcron:start-main-ran-through:FAIL [marker or pidfile missing]'
+fi
+
+# ── subscription_update <interval> touches only that interval ───
+# The real function is exercised with the download/apply helpers stubbed, and
+# config_get/config_foreach fed three subscription sections: two with a known
+# interval and one carrying an unknown value.
+eval "$(extract subscription_update)"
+
+TMP_SUBSCRIPTION_FOLDER="$WORK/sub-tmp"
+TMP_SING_BOX_FOLDER="$WORK/sing-box"
+SUBSCRIPTION_PENDING_APPLY_FLAG="$TMP_SING_BOX_FOLDER/subscription-pending-apply"
+SUBSCRIPTION_CACHE_FOLDER="$WORK/sub-cache"
+mkdir -p "$SUBSCRIPTION_CACHE_FOLDER"
+
+config_foreach() { "$1" "fast"; "$1" "slow"; "$1" "odd"; }
+config_get() {
+    case "$2:$3" in
+    fast:connection_type | slow:connection_type | odd:connection_type) eval "$1=proxy" ;;
+    fast:proxy_config_type | slow:proxy_config_type | odd:proxy_config_type) eval "$1=subscription" ;;
+    fast:subscription_update_interval) eval "$1=30m" ;;
+    slow:subscription_update_interval) eval "$1=1d" ;;
+    odd:subscription_update_interval) eval "$1=2h" ;;
+    *) eval "$1=\"\${4:-}\"" ;;
+    esac
+}
+ensure_subscription_cache_dir() { :; }
+reap_legacy_subscription_cache_files() { :; }
+get_subscription_urls_for_section() { printf '%s\n' "https://feed.example.com/$1"; }
+get_subscription_url_hash() { printf 'feedhash'; }
+get_subscription_json_path() { printf '%s' "$SUBSCRIPTION_CACHE_FOLDER/$1.$2.json"; }
+get_subscription_url_cache_path() { printf '%s' "$SUBSCRIPTION_CACHE_FOLDER/$1.$2.url"; }
+get_subscription_download_proxy_address() { :; }
+wait_for_subscription_connectivity() { return 0; }
+redact_url_for_log() { printf '%s' "$1"; }
+subscription_cache_is_usable() { return 0; }
+download_subscription_into_cache() {
+    printf '%s' '{"outbounds":[{"type":"vless","tag":"node-1"}]}' > "$3"
+    printf '%s\n' "$1" >> "$WORK/updated.log"
+    return 0
+}
+reload_sing_box_config_in_place() { return 0; }
+
+updated_sections() {
+    : > "$WORK/updated.log"
+    rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+    subscription_update "$1" > /dev/null 2>&1
+    printf '%s' "$(sort -u "$WORK/updated.log" | tr '\n' ' ')"
+}
+
+got="$(updated_sections 30m)"
+if [ "$got" = "fast " ]; then
+    echo 'subcron:filter-30m-only-fast:OK'
+else
+    echo "subcron:filter-30m-only-fast:FAIL [$got]"
+fi
+got="$(updated_sections 1d)"
+if [ "$got" = "slow " ]; then
+    echo 'subcron:filter-1d-only-slow:OK'
+else
+    echo "subcron:filter-1d-only-slow:FAIL [$got]"
+fi
+# The 1h job is the one the unknown value fell back to, so it has to pick that
+# section up — a job that is created but never matches its section would leave
+# the section un-updated just like being dropped from every job did.
+got="$(updated_sections 1h)"
+if [ "$got" = "odd " ]; then
+    echo 'subcron:filter-1h-picks-unknown-value:OK'
+else
+    echo "subcron:filter-1h-picks-unknown-value:FAIL [$got]"
+fi
+got="$(updated_sections '')"
+if [ "$got" = "fast odd slow " ]; then
+    echo 'subcron:no-filter-updates-all:OK'
+else
+    echo "subcron:no-filter-updates-all:FAIL [$got]"
+fi
+got="$(updated_sections 6h)"
+if [ "$got" = "" ]; then
+    echo 'subcron:filter-unused-interval-noop:OK'
+else
+    echo "subcron:filter-unused-interval-noop:FAIL [$got]"
+fi
+# A filter that matches nothing must still succeed: the cron job of an interval
+# whose last section was removed has to exit cleanly, not report a failure.
+subscription_update 6h > /dev/null 2>&1
+if [ "$?" -eq 0 ]; then
+    echo 'subcron:filter-unused-interval-rc:OK'
+else
+    echo 'subcron:filter-unused-interval-rc:FAIL'
+fi
+# An interval this version does not schedule is not a filter that matches
+# nothing: the call used to update no section at all and still exit 0. It
+# refreshes every section instead, which the log says out loud.
+: > "$LOG_FILE"
+got="$(updated_sections 2h)"
+if [ "$got" = "fast odd slow " ]; then
+    echo 'subcron:unknown-arg-updates-all:OK'
+else
+    echo "subcron:unknown-arg-updates-all:FAIL [$got]"
+fi
+if grep -q "^\[warn\] ⚠️ Unknown subscription update interval '2h'" "$LOG_FILE"; then
+    echo 'subcron:unknown-arg-warned:OK'
+else
+    echo "subcron:unknown-arg-warned:FAIL [$(tr '\n' ';' < "$LOG_FILE")]"
+fi
+subscription_update 2h > /dev/null 2>&1
+if [ "$?" -eq 0 ]; then
+    echo 'subcron:unknown-arg-rc:OK'
+else
+    echo 'subcron:unknown-arg-rc:FAIL'
+fi
+# ... and the same for a value with a typo in the unit.
+got="$(updated_sections 2H)"
+if [ "$got" = "fast odd slow " ]; then
+    echo 'subcron:unknown-arg-case-updates-all:OK'
+else
+    echo "subcron:unknown-arg-case-updates-all:FAIL [$got]"
+fi
+
+rm -rf "$WORK"
+echo 'DONE'
+SUBCRONEOF
+    sed -i "s|LIB_DIR_PLACEHOLDER|$lib|g; s|BIN_PATH_PLACEHOLDER|$bin|g" "$drv"
+
+    local sub_out="/tmp/netshift-subcron-out-$$"
+    sh "$drv" > "$sub_out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+        *:FAIL*) fail "$line" ;;
+        *:SKIP*) skip "$line" ;;
+        *:OK) pass "$line" ;;
+        DONE) saw_done=1 ;;
+        *) ;;
+        esac
+    done < "$sub_out"
+    # The driver echoes DONE last. Without this guard a driver that died in the
+    # middle (a syntax error in an extracted function, for instance) would report
+    # "passed" with nothing checked.
+    if [ "$saw_done" = "1" ]; then
+        pass "subcron-driver-completed"
+    else
+        fail "subcron-driver-completed:FAIL (driver aborted early)" "$(tail -5 "$sub_out" 2>/dev/null)"
+    fi
+    rm -f "$drv" "$sub_out"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: global_proxy route rule semantics
 # ─────────────────────────────────────────────────────────────────
 test_global_proxy() {
@@ -8561,7 +9148,10 @@ route_table_rule_mark() { :; }
 create_nft_rules() { :; }
 sing_box_configure_service() { :; }
 add_cron_job() { :; }
-add_subscription_cron_job() { :; }
+# start_main has to (re)build the subscription jobs once the config it just built
+# was accepted. The stub counts the calls, so dropping the call from start_main
+# fails the assertions below instead of passing unnoticed.
+sync_subscription_cron_jobs() { printf 'sync\n' >> "$HR_DIR/sub_cron_sync.log"; }
 list_update() { :; }
 hr_sing_box_start() { printf 'start\n' >> "$HR_DIR/sb_start.log"; }
 
@@ -8570,6 +9160,7 @@ rm -f "$HR_DIR/sb_start.log"
 mkdir -p "$TMP_SING_BOX_FOLDER"
 : > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 HR_BUILD_OK=1
+rm -f "$HR_DIR/sub_cron_sync.log"
 ( start_main ) > /dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 0 ] && [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ "$(hr_count sb_start)" = "1" ]; then
@@ -8577,10 +9168,18 @@ if [ "$rc" -eq 0 ] && [ ! -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ "$(hr_cou
 else
     echo "hr-start-built-config-drops-marker(rc=$rc started=$(hr_count sb_start) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
 fi
+if [ "$(hr_count sub_cron_sync)" = "1" ]; then
+    echo 'hr-start-syncs-subscription-cron-jobs:OK'
+else
+    echo "hr-start-syncs-subscription-cron-jobs(syncs=$(hr_count sub_cron_sync)):FAIL"
+fi
 
 # CASE S2: sing-box rejects the config -> start_main exits before the marker
-#          line, so the next subscription_update still applies the change.
+#          line, so the next subscription_update still applies the change. The
+#          subscription cron jobs are not rebuilt either: the config they would
+#          drive was never accepted.
 rm -f "$HR_DIR/sb_start.log"
+rm -f "$HR_DIR/sub_cron_sync.log"
 : > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 HR_BUILD_OK=0
 ( start_main ) > /dev/null 2>&1
@@ -8590,6 +9189,11 @@ if [ "$rc" -ne 0 ] && [ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && [ "$(hr_count
     echo 'hr-start-rejected-config-keeps-marker:OK'
 else
     echo "hr-start-rejected-config-keeps-marker(rc=$rc started=$(hr_count sb_start) marker=$([ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && echo yes || echo no)):FAIL"
+fi
+if [ "$(hr_count sub_cron_sync)" = "0" ]; then
+    echo 'hr-start-rejected-config-skips-cron-sync:OK'
+else
+    echo "hr-start-rejected-config-skips-cron-sync(syncs=$(hr_count sub_cron_sync)):FAIL"
 fi
 unset -f sleep
 
@@ -8941,6 +9545,7 @@ main() {
             test_selfheal
             test_dns_via_outbound
             test_sub_url_option
+            test_sub_cron
             test_global_proxy
             test_check_update_stable
             test_check_update_extended
@@ -8974,6 +9579,7 @@ main() {
         selfheal)    test_selfheal ;;
         dnsdetour)   test_dns_via_outbound ;;
         suburlopt)   test_sub_url_option ;;
+        subcron)     test_sub_cron ;;
         globalproxy) test_global_proxy ;;
         stablecheck) test_check_update_stable ;;
         extcheck)    test_check_update_extended ;;
@@ -8990,7 +9596,7 @@ main() {
         proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt subcron globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac

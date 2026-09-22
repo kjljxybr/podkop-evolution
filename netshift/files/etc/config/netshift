@@ -69,6 +69,11 @@ config section 'main'
 #        # 'auto' preserves the default order. Ignored when subscription_user_agent
 #        # is set (an explicit UA always wins).
 #        #option subscription_format_preference 'auto'
+#        # How often THIS section's feeds are re-fetched: 30m | 1h | 3h | 6h |
+#        # 12h | 1d. Every section keeps its own schedule, wherever it sits in
+#        # the config; sections sharing a value share one cron job. A value
+#        # outside the list (a hand-edited UCI option, say '2h') is treated as
+#        # 1h with a warning instead of dropping the section from every job.
 #        option subscription_update_interval '1h'
 #        # Node grouping: off | country | prefix. 'country' clusters by leading
 #        # flag emoji; 'prefix' clusters by the first N codepoints of each node
