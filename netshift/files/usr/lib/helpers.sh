@@ -31,6 +31,14 @@ is_domain_suffix() {
     is_domain "$normalized"
 }
 
+# Lowercases a domain name. DNS names are case-insensitive, but is_domain only
+# accepts [a-z0-9], so a UCI value typed as "Example.COM" would be dropped
+# instead of producing a rule. Every user-supplied domain goes through this
+# before validation, so the stored rule is always lowercase (issue #52).
+normalize_domain_case() {
+    printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
 # Checks if the given string is a valid base64-encoded sequence
 is_base64() {
     local str="$1"
@@ -648,7 +656,9 @@ parse_domain_or_subnet_string_to_commas_string() {
 
 #######################################
 # Parses a file line by line, validates entries as either domains or subnets,
-# and returns a single comma-separated string of valid items.
+# and returns a single comma-separated string of valid items. Domains are
+# lowercased before validation (DNS is case-insensitive), so mixed-case input
+# such as "Example.COM" yields a rule instead of being discarded.
 # Arguments:
 #   $1 - Path to the input file
 #   $2 - Type of validation ("domains" or "subnets")
@@ -667,6 +677,7 @@ parse_domain_or_subnet_file_to_comma_string() {
 
         case "$type" in
         domains)
+            line="$(normalize_domain_case "$line")"
             if ! is_domain_suffix "$line"; then
                 log "'$line' is not a valid domain" "debug"
                 continue

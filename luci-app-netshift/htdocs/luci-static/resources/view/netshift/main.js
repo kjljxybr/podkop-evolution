@@ -98,6 +98,12 @@ function validateDomain(domain, allowDotTLD = false) {
   }
   return { valid: true, message: _("Valid") };
 }
+function validateDomainRule(domain, allowDotTLD = false) {
+  if (domain.includes("/")) {
+    return { valid: false, message: _("Invalid domain address") };
+  }
+  return validateDomain(domain, allowDotTLD);
+}
 
 // src/validators/validateDns.ts
 function validateDNS(value) {
@@ -6190,6 +6196,7 @@ return baseclass.extend({
   svgEl,
   validateDNS,
   validateDomain,
+  validateDomainRule,
   validateIP,
   validateIPV4,
   validateIPV6,
