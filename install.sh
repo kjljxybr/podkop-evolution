@@ -271,9 +271,110 @@ download_release_asset() {
     return 1
 }
 
+# Returns 0 if the sing-box binary on the router is an "extended" build.
+# The backend tests the version string the same way (helpers.sh
+# is_sing_box_extended); the installer cannot source the backend libraries
+# (they may not be installed yet), so the check is repeated locally.
+sing_box_is_extended() {
+    command -v sing-box >/dev/null 2>&1 || return 1
+
+    case "$(sing-box version 2>/dev/null | head -n 1)" in
+    *extended*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# Asks which sing-box core to install and stores the answer in SING_BOX_CORE
+# (stock|extended). Same plain read loop as the Russian-language prompt below:
+# an unrecognised answer re-asks instead of aborting the install. On EOF (the
+# script is piped rather than run from a terminal) the stock core is chosen,
+# which is what the installer did before this prompt existed.
+select_sing_box_core() {
+    msg "Какое ядро sing-box поставить? (Which sing-box core to install?)"
+    msg "1) Стоковый sing-box (stock, из фидов OpenWrt)"
+    msg "2) sing-box-extended (сборка shtorm-7, больше протоколов)"
+
+    while true; do
+        if ! read -r -p '' CORE; then
+            msg "Нет ответа, ставим стоковый sing-box (No input, installing the stock core)"
+            SING_BOX_CORE="stock"
+            break
+        fi
+
+        case $CORE in
+        1)
+            SING_BOX_CORE="stock"
+            break
+            ;;
+        2)
+            SING_BOX_CORE="extended"
+            break
+            ;;
+        *)
+            echo "Введите 1 или 2 (Enter 1 or 2)"
+            ;;
+        esac
+    done
+}
+
+# Applies the core chosen in select_sing_box_core. Both directions go through
+# the backend component action — the same one the LuCI component manager calls —
+# so the download, the tmpfs backup/rollback and the extended-only libcronet.so
+# handling are not duplicated here. By this point the package install has
+# already pulled the stock core in as a netshift dependency, so the stock choice
+# is a no-op unless an extended build is currently in place.
+apply_sing_box_core() {
+    local action="" result
+
+    case "$SING_BOX_CORE" in
+    extended)
+        if sing_box_is_extended; then
+            msg "sing-box-extended is already installed"
+            return 0
+        fi
+        action="install_extended"
+        ;;
+    stock)
+        if ! command -v sing-box >/dev/null 2>&1; then
+            msg "sing-box is not installed; the stock core comes with the NetShift package"
+            return 0
+        fi
+        if ! sing_box_is_extended; then
+            msg "Stock sing-box is already installed"
+            return 0
+        fi
+        action="install_stable"
+        ;;
+    *)
+        return 0
+        ;;
+    esac
+
+    if [ ! -x /usr/bin/netshift ]; then
+        msg "NetShift binary not found; skipping the sing-box core switch"
+        return 1
+    fi
+
+    msg "Switching the sing-box core ($action)..."
+    result=$(/usr/bin/netshift component_action sing_box "$action" 2>&1)
+
+    case "$result" in
+    *'"success":true'*)
+        msg "sing-box core switched successfully"
+        ;;
+    *)
+        msg "Failed to switch the sing-box core; NetShift keeps the core it had."
+        msg "$result"
+        return 1
+        ;;
+    esac
+}
+
 main() {
     check_system
     sing_box
+    select_sing_box_core
 
     /usr/sbin/ntpd -q -p 194.190.168.1 -p 216.239.35.0 -p 216.239.35.4 -p 162.159.200.1 -p 162.159.200.123
 
@@ -397,6 +498,8 @@ main() {
             done
         fi
     fi
+
+    apply_sing_box_core
 
     find "$DOWNLOAD_DIR" -type f -name '*netshift*' -exec rm {} \;
 }
