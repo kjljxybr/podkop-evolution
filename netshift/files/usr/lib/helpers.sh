@@ -625,10 +625,14 @@ subscription_body_is_binary() {
 }
 
 #######################################
-# Parses a whitespace-separated string, validates items as either domains
-# or IPv4 addresses/subnets, and returns a comma-separated string of valid items.
+# Parses a comma- or whitespace-separated string, validates items as either
+# domains or IPv4 addresses/subnets, and returns a comma-separated string of
+# valid items. Items may be separated by commas or by any ASCII whitespace —
+# space, tab, CR, LF, VT, FF — which is the same set the UI splits on
+# (parseValueList uses /[,\s]+/), so a list pasted from a spreadsheet or a TSV
+# column is not silently collapsed into one invalid item.
 # Arguments:
-#   $1 - Input string (space-separated list of items)
+#   $1 - Input string (comma- and/or whitespace-separated list of items)
 #   $2 - Type of validation ("domains" or "subnets")
 # Outputs:
 #   Comma-separated string of valid domains or subnets
@@ -638,7 +642,10 @@ parse_domain_or_subnet_string_to_commas_string() {
     local type="$2"
 
     tmpfile=$(mktemp)
-    printf "%s\n" "$string" | sed 's/\/\/.*//' | tr ', ' '\n' | grep -v '^$' > "$tmpfile"
+    # Busybox `tr` has no POSIX `[:space:]` class (it would read the bracket
+    # expression as a literal character list), so the whitespace characters are
+    # spelled out as octal escapes.
+    printf "%s\n" "$string" | sed 's/\/\/.*//' | tr ', \011\012\013\014\015' '\n' | grep -v '^$' > "$tmpfile"
 
     result="$(parse_domain_or_subnet_file_to_comma_string "$tmpfile" "$type")"
     rm -f "$tmpfile"

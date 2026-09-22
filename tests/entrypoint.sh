@@ -8324,6 +8324,245 @@ HREOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: Domain/subnet list separators — commas and ANY ASCII whitespace
+#
+# The UI validates a Text List by splitting it on /[,\s]+/ (parseValueList), so
+# a list pasted from a spreadsheet arrives tab-separated. The backend split the
+# value with `tr ', ' '\n'`, which does NOT split on a tab: the whole line stayed
+# a single item, failed domain validation and was dropped — every domain on that
+# line silently disappeared (issue #53).
+#
+# The driver sources the REAL helpers.sh / rulesets.sh / sing_box_config_manager.sh,
+# pulls configure_user_domain_list / configure_user_subnet_list /
+# prepare_source_ruleset out of the shipped bin VERBATIM, and drives them with
+# tab-separated UCI values through a config_get stub. It then asserts the
+# generated source rule-set files carry both items and that a full sing-box
+# config referencing those files passes `sing-box check`.
+#
+# Gating: tokens are consumed in the CURRENT shell via `while read < file`, so
+# pass/fail mutate the real counters. Reverting the shipped separator set to
+# `tr ', ' '\n'` FAILs exactly 9 tokens: ds-tab-domains, ds-tab-subnets,
+# ds-tab-run, ds-mixed-separators, ds-vt-ff, ds-comment-header,
+# ds-invalid-dropped, ds-ruleset-domains and ds-ruleset-subnets.
+# (ds-singbox-check stays OK either way: an empty rule set is still a valid
+# sing-box config — it only guards the generated JSON against corruption.)
+# ─────────────────────────────────────────────────────────────────
+test_domain_separators() {
+    header "Domain/Subnet List Separators (issue #53)"
+
+    local lib="${NETSHIFT_LIB_DIR}"
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    if [ ! -r "$bin" ] || [ ! -r "$lib/helpers.sh" ] || \
+        [ ! -r "$lib/rulesets.sh" ] || [ ! -r "$lib/sing_box_config_manager.sh" ] || \
+        [ ! -r "$lib/helpers.jq" ]; then
+        skip "netshift bin / helpers.sh / rulesets.sh / sing_box_config_manager.sh / helpers.jq not found"
+        return
+    fi
+
+    # patch_route_rule / patch_dns_route_rule import helpers.jq from this path.
+    mkdir -p /usr/lib/netshift
+    ln -sf "$lib/helpers.jq" /usr/lib/netshift/helpers.jq
+
+    local drv="/tmp/netshift-domsep-$$.sh"
+    local out="/tmp/netshift-domsep-$$.out"
+    cat > "$drv" << 'DSEOF'
+log() { :; }
+echolog() { :; }
+nolog() { :; }
+
+. "LIB_DIR/constants.sh"
+. "LIB_DIR/helpers.sh"
+. "LIB_DIR/rulesets.sh"
+. "LIB_DIR/sing_box_config_manager.sh"
+
+# Functions under test come VERBATIM from the shipped bin.
+extract() {
+    awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH"
+}
+eval "$(extract rule_references_ruleset)"
+eval "$(extract prepare_source_ruleset)"
+eval "$(extract configure_user_domain_list)"
+eval "$(extract configure_user_subnet_list)"
+eval "$(extract populate_netshift_subnets_from_string)"
+eval "$(extract populate_netshift_subnets_from_file)"
+eval "$(extract netshift_ipv6_enabled)"
+
+# UCI stub: reads the DS_<section>_<option> variables assigned below.
+ds_key() { printf 'DS_%s_%s' "$(printf '%s' "$1" | tr '.-' '__')" "$2"; }
+config_get() {
+    local _k _v
+    _k="$(ds_key "$2" "$3")"
+    eval "_v=\"\${$_k:-}\""
+    [ -n "$_v" ] || _v="$4"
+    eval "$1=\"\$_v\""
+    return 0
+}
+config_get_bool() {
+    local _k _v
+    _k="$(ds_key "$2" "$3")"
+    eval "_v=\"\${$_k:-}\""
+    [ -n "$_v" ] || _v="$4"
+    case "$_v" in
+    1 | on | true | yes | enabled) _v=1 ;;
+    *) _v=0 ;;
+    esac
+    eval "$1=\"\$_v\""
+    return 0
+}
+
+DS_DIR="/tmp/netshift-domsep-state-$$"
+rm -rf "$DS_DIR"
+mkdir -p "$DS_DIR"
+TMP_RULESET_FOLDER="$DS_DIR/rulesets"
+mkdir -p "$TMP_RULESET_FOLDER"
+
+base_config() {
+    config='{"route":{"rules":[],"rule_set":[]},"dns":{"rules":[]}}'
+    config=$(sing_box_cm_add_route_rule "$config" "main-route-rule" "tproxy-in" "main-out")
+    config=$(sing_box_cm_add_dns_route_rule "$config" "$SB_FAKEIP_DNS_SERVER_TAG" "$SB_FAKEIP_DNS_RULE_TAG")
+}
+
+# The token MUST be the whole line: the consumer matches `*:OK` / `*:FAIL` at
+# end-of-line, so any diagnostic has to go on its own (ignored) line.
+ds_eq() {
+    if [ "$2" = "$3" ]; then
+        echo "$1:OK"
+    else
+        echo "# ds-detail $1: got [$2], want [$3]"
+        echo "$1:FAIL"
+    fi
+}
+ds_parse_eq() {
+    ds_eq "$1" "$(parse_domain_or_subnet_string_to_commas_string "$4" "$3")" "$2"
+}
+ds_keys() {
+    jq -r --arg k "$2" '[.rules[]? | (.[$k] // empty) | .[]] | sort | join(" ")' "$1" 2>/dev/null
+}
+
+# ── unit: parse_domain_or_subnet_string_to_commas_string ────────────────────
+ds_parse_eq "ds-tab-domains" "example.com,example.org" "domains" "$(printf 'example.com\texample.org')"
+ds_parse_eq "ds-tab-subnets" "10.0.0.0/8,192.168.1.1" "subnets" "$(printf '10.0.0.0/8\t192.168.1.1')"
+ds_parse_eq "ds-tab-run" "example.com,example.org" "domains" "$(printf 'example.com\t\t\texample.org')"
+ds_parse_eq "ds-tab-padded" "example.com,example.org" "domains" "$(printf '  example.com\t example.org  ')"
+# regression: the separators that already worked must keep working
+ds_parse_eq "ds-space-regression" "example.com,example.org" "domains" "example.com example.org"
+ds_parse_eq "ds-comma-regression" "example.com,example.org" "domains" "example.com,example.org"
+ds_parse_eq "ds-newline-regression" "example.com,example.org" "domains" "$(printf 'example.com\nexample.org')"
+ds_parse_eq "ds-crlf-regression" "example.com,example.org" "domains" "$(printf 'example.com\r\nexample.org')"
+# every separator the UI splits on (/[,\s]+/) at once
+ds_parse_eq "ds-mixed-separators" "a.example.com,b.example.com,c.example.com,d.example.com" "domains" \
+    "$(printf 'a.example.com, b.example.com\tc.example.com  d.example.com')"
+ds_parse_eq "ds-vt-ff" "example.com,example.org,x.example.com" "domains" \
+    "$(printf 'example.com\013example.org\014x.example.com')"
+# comments (//) are still honoured, including on a tab-separated line
+ds_parse_eq "ds-comment-trailing" "example.com" "domains" "$(printf 'example.com\t// a note')"
+ds_parse_eq "ds-comment-header" "example.com,example.org" "domains" \
+    "$(printf '// header\n\t example.com\texample.org')"
+# an invalid item is still dropped without taking its valid neighbours with it
+ds_parse_eq "ds-invalid-dropped" "example.com" "domains" "$(printf 'bad_domain\texample.com')"
+ds_parse_eq "ds-empty" "" "domains" ""
+
+# ── end-to-end: UCI text option -> source rule-set file ─────────────────────
+base_config
+DS_main_user_domain_list_type="text"
+DS_main_user_domains_text="$(printf 'example.com\texample.org')"
+configure_user_domain_list "main" "main-route-rule"
+ds_rc=$?
+ds_eq "ds-config-no-abort" "$ds_rc" "0"
+
+base_config
+DS_main_user_subnet_list_type="text"
+DS_main_user_subnets_text="$(printf '10.0.0.0/8\t192.168.1.1')"
+configure_user_subnet_list "main" "main-route-rule"
+ds_rc=$?
+ds_eq "ds-subnet-config-no-abort" "$ds_rc" "0"
+
+ds_dom_file="$TMP_RULESET_FOLDER/main-user-domains-ruleset.json"
+ds_net_file="$TMP_RULESET_FOLDER/main-user-subnets-ruleset.json"
+ds_eq "ds-ruleset-domains" "$(ds_keys "$ds_dom_file" domain_suffix)" "example.com example.org"
+ds_eq "ds-ruleset-subnets" "$(ds_keys "$ds_net_file" ip_cidr)" "10.0.0.0/8 192.168.1.1"
+
+# ── upgrade simulation: the fix introduces no new UCI option, and a config
+# that lacks the text value (or the mode selector) must still build without
+# aborting and produce an empty rule set — the pre-existing behaviour.
+unset DS_main_user_domains_text
+base_config
+configure_user_domain_list "main" "main-route-rule"
+ds_rc=$?
+ds_eq "ds-missing-value-no-abort" "$ds_rc" "0"
+ds_eq "ds-missing-value-empty" "$(ds_keys "$ds_dom_file" domain_suffix)" ""
+
+unset DS_main_user_domain_list_type
+base_config
+configure_user_domain_list "main" "main-route-rule"
+ds_rc=$?
+ds_eq "ds-missing-mode-no-abort" "$ds_rc" "0"
+
+# ── full sing-box config referencing both generated rule-set files ──────────
+if command -v sing-box > /dev/null 2>&1; then
+    base_config
+    DS_main_user_domain_list_type="text"
+    DS_main_user_domains_text="$(printf 'example.com\texample.org')"
+    configure_user_domain_list "main" "main-route-rule"
+    DS_main_user_subnet_list_type="text"
+    DS_main_user_subnets_text="$(printf '10.0.0.0/8\t192.168.1.1')"
+    configure_user_subnet_list "main" "main-route-rule"
+
+    printf '%s' "$config" | jq --arg srv "$SB_FAKEIP_DNS_SERVER_TAG" '{
+        log: { level: "error" },
+        dns: {
+            rules: [.dns.rules[] | del(."__service_tag")],
+            servers: [{ tag: $srv, type: "udp", server: "1.1.1.1" }],
+            final: $srv
+        },
+        inbounds: [{ type: "tproxy", tag: "tproxy-in", listen: "127.0.0.1", listen_port: 1602 }],
+        outbounds: [{ type: "direct", tag: "main-out" }, { type: "direct", tag: "direct-out" }],
+        route: {
+            rule_set: .route.rule_set,
+            rules: [.route.rules[] | del(."__service_tag")],
+            final: "direct-out"
+        }
+    }' > "$DS_DIR/full.json" 2>/dev/null
+
+    if sing-box -c "$DS_DIR/full.json" check > /dev/null 2>&1; then
+        echo 'ds-singbox-check:OK'
+    else
+        echo "# ds-detail sing-box check: $(sing-box -c "$DS_DIR/full.json" check 2>&1 | head -n 2 | tr '\n' ' ')"
+        echo 'ds-singbox-check:FAIL'
+    fi
+else
+    echo 'ds-singbox-check:SKIP (sing-box not installed)'
+fi
+
+rm -rf "$DS_DIR"
+echo 'DONE'
+DSEOF
+    sed -i "s|LIB_DIR|$lib|g; s|BIN_PATH|$bin|g" "$drv"
+
+    # Run the driver to a RESULT FILE, then consume tokens in the CURRENT shell
+    # (while read < file — NO pipe) so pass/fail/skip mutate the real counters.
+    sh "$drv" > "$out" 2>/dev/null
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "$line" ;;
+            *:FAIL) fail "$line" ;;
+            *:SKIP) skip "$line" ;;
+            DONE) saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "ds-driver-completed:OK"
+    else
+        fail "ds-driver-completed:FAIL (driver aborted early)" \
+            "$(grep '^# ds-detail' "$out" 2>/dev/null | head -5)"
+    fi
+
+    rm -f "$drv" "$out"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────
 main() {
@@ -8370,6 +8609,7 @@ main() {
             test_self_update_netshift
             test_backup_integrity
             test_hot_reload
+            test_domain_separators
             ;;
         deps)        test_deps ;;
         syntax)      test_syntax ;;
@@ -8401,12 +8641,13 @@ main() {
         selfupdate)  test_self_update_netshift ;;
         backupguard) test_backup_integrity ;;
         hotreload)   test_hot_reload ;;
+        domsep)      test_domain_separators ;;
         jq)          test_jq_helpers ;;
         cm)          test_config_manager ;;
         sb)          test_sing_box_config ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload domsep"
             exit 1
             ;;
     esac
