@@ -288,7 +288,7 @@ TESTEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -1455,7 +1455,7 @@ USEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK)   pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE)   saw_done=1 ;;
             *) ;;
@@ -1654,7 +1654,7 @@ TLEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK)   pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE)   saw_done=1 ;;
             *) ;;
@@ -2006,7 +2006,7 @@ DOMCASEEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK)   pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE)   saw_done=1 ;;
             *) ;;
@@ -2516,7 +2516,7 @@ VMEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -2821,7 +2821,7 @@ CMEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -4095,7 +4095,7 @@ FBEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -4397,7 +4397,7 @@ MUEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -4642,7 +4642,7 @@ CCEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) ;;
             *) ;;
@@ -5285,7 +5285,7 @@ VEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             DONE) saw_done=1 ;;
         esac
     done < "$js_out"
@@ -5335,7 +5335,7 @@ SEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             DONE) saw_done=1 ;;
         esac
     done < "$stale_out"
@@ -6341,7 +6341,7 @@ RHEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) ;;
             *) ;;
@@ -6530,7 +6530,7 @@ DDEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -7924,7 +7924,7 @@ BTEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
@@ -9483,7 +9483,7 @@ DRVEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "${line%:OK}" ;;
-            *:FAIL) fail "$line" "$(cat "$out" 2>/dev/null)" ;;
+            *:FAIL*) fail "$line" "$(cat "$out" 2>/dev/null)" ;;
         esac
     done < "$out"
 
@@ -10202,7 +10202,7 @@ HREOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "${line%:OK}" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             DONE) saw_done=1 ;;
         esac
     done < "$out"
@@ -10438,7 +10438,7 @@ DSEOF
     while IFS= read -r line; do
         case "$line" in
             *:OK) pass "$line" ;;
-            *:FAIL) fail "$line" ;;
+            *:FAIL*) fail "$line" ;;
             *:SKIP) skip "$line" ;;
             DONE) saw_done=1 ;;
             *) ;;
