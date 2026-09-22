@@ -178,6 +178,7 @@ SB_SUBSCRIPTION_FASTEST_GROUP_TAG="⚡ Fastest"
 SB_REJECT_RULE_TAG="reject-rule-tag"
 SB_EXCLUSION_RULE_TAG="exclusion-rule-tag"
 SB_DOH_BLOCK_RULE_TAG="doh-block-rule-tag"
+SB_BITTORRENT_DIRECT_RULE_TAG="bittorrent-direct-rule-tag"
 # Experimental
 SB_CLASH_API_CONTROLLER_PORT=9090
 

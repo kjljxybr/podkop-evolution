@@ -240,6 +240,11 @@ uci set netshift.settings.dns_via_outbound='1'
 # Блокировать QUIC (заставляет приложения откатываться на TCP/TLS).
 uci set netshift.settings.disable_quic='1'
 
+# Пропускать BitTorrent мимо туннеля: торрент-трафик (TCP и UDP, определяется
+# сниффингом протокола) идёт напрямую, минуя прокси/VPN. По умолчанию выкл.
+# Нужно тем, у кого провайдер блокирует подписку за торренты.
+uci set netshift.settings.exclude_bittorrent='1'
+
 uci commit netshift
 ```
 

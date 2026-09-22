@@ -6495,6 +6495,232 @@ test_global_proxy() {
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: BitTorrent exclusion (issue #56)
+# ─────────────────────────────────────────────────────────────────
+# Exercises the REAL sing_box_configure_route (extracted verbatim from the bin,
+# like test_dns_via_outbound extracts _get_dns_detour_tag) with a stubbed UCI
+# layer, plus the REAL sing-box_config_manager helpers. Asserts:
+#   - upgrade simulation: with `exclude_bittorrent` ABSENT from the saved UCI
+#     config the generated config is byte-identical to an explicit `0` and
+#     carries no BitTorrent rule (sing-box check still passes);
+#   - option on: exactly one route rule, protocol bittorrent -> direct-out,
+#     placed IMMEDIATELY after the sniff rule (a rule placed before sniff can
+#     never match — the protocol is not sniffed yet);
+#   - option on is purely additive: every other route rule is untouched.
+test_bittorrent_direct() {
+    header "BitTorrent Exclusion (issue #56)"
+
+    if ! command -v jq > /dev/null 2>&1; then
+        skip "jq not available"
+        return
+    fi
+
+    local cm_lib="${NETSHIFT_LIB_DIR}/sing_box_config_manager.sh"
+    local facade_lib="${NETSHIFT_LIB_DIR}/sing_box_config_facade.sh"
+    local constants_lib="${NETSHIFT_LIB_DIR}/constants.sh"
+    local jq_helpers="${NETSHIFT_LIB_DIR}/helpers.jq"
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    if [ ! -r "$cm_lib" ] || [ ! -r "$facade_lib" ] || [ ! -r "$constants_lib" ] || [ ! -r "$jq_helpers" ] \
+        || [ ! -r "$bin" ]; then
+        skip "config manager / facade / constants / helpers.jq / netshift bin not found"
+        return
+    fi
+
+    # The manager and the facade hardcode the runtime library path; bind the
+    # bind-mounted sources there (test_dns_via_outbound pattern).
+    mkdir -p /usr/lib/netshift
+    ln -sf "$jq_helpers" /usr/lib/netshift/helpers.jq
+    ln -sf "${NETSHIFT_LIB_DIR}/helpers.sh" /usr/lib/netshift/helpers.sh
+    ln -sf "$cm_lib" /usr/lib/netshift/sing_box_config_manager.sh
+
+    local drv="/tmp/netshift-bittorrent-$$.sh"
+    cat > "$drv" << 'BTEOF'
+LIB="NETSHIFT_LIB"
+BIN="BIN_PATH"
+FACADE="FACADE_PATH"
+
+. "$LIB/constants.sh"
+. "$LIB/helpers.sh"
+. "$LIB/logging.sh" 2>/dev/null || log() { :; }
+. "$FACADE"
+
+# UCI stubs mirroring /lib/functions.sh: config_get_bool falls back to its
+# default argument when the option is absent, which is exactly the upgrade case.
+config_get_bool() {
+    local _tmp=""
+    case "$3" in
+    exclude_bittorrent) _tmp="$UCI_EXCLUDE_BITTORRENT" ;;
+    esac
+    case "$_tmp" in
+    1 | on | true | yes | enabled) _tmp=1 ;;
+    0 | off | false | no | disabled) _tmp=0 ;;
+    *) _tmp="$4" ;;
+    esac
+    eval "$1=\"\$_tmp\""
+    return 0
+}
+config_get() {
+    eval "$1=\"\""
+    return 0
+}
+config_foreach() { :; }
+config_list_foreach() { :; }
+get_global_proxy_section() { echo ""; }
+netshift_ipv6_enabled() { return 1; }
+get_sections_by_connection_type() { echo ""; }
+get_first_outbound_section() { echo ""; }
+get_outbound_tag_by_section() { echo "$1-out"; }
+subscription_outbound_is_unavailable() { return 1; }
+
+# Pull the real route builder + its two helpers VERBATIM out of the bin.
+for fn in sing_box_configure_route configure_common_reject_route_rule configure_common_direct_route_rule; do
+    eval "$(awk -v name="$fn" '$0 == name "() {"{p=1} p{print} p&&/^\}/{exit}' "$BIN")"
+done
+if command -v sing_box_configure_route > /dev/null 2>&1 &&
+    command -v configure_common_reject_route_rule > /dev/null 2>&1 &&
+    command -v configure_common_direct_route_rule > /dev/null 2>&1; then
+    echo 'bittorrent-real-functions-loaded:OK'
+else
+    echo 'bittorrent-real-functions-loaded:FAIL'
+fi
+
+base=$(jq -n \
+    --arg direct "$SB_DIRECT_OUTBOUND_TAG" \
+    --arg tproxy "$SB_TPROXY_INBOUND_TAG" \
+    --arg listen "$SB_TPROXY_INBOUND_ADDRESS" \
+    --argjson port "$SB_TPROXY_INBOUND_PORT" \
+    --arg dns "$SB_DNS_SERVER_TAG" \
+    '{
+    log: { disabled: false, level: "warn", timestamp: true },
+    dns: {
+        servers: [{ type: "udp", tag: $dns, server: "77.88.8.8" }],
+        rules: [], final: $dns, strategy: "prefer_ipv4", independent_cache: true
+    },
+    inbounds: [
+        { type: "tproxy", tag: $tproxy, listen: $listen, listen_port: $port }
+    ],
+    outbounds: [
+        { type: "direct", tag: $direct }
+    ],
+    route: { rules: [], rule_set: [], final: $direct, auto_detect_interface: true }
+}')
+
+gen() {
+    # $1 = UCI value of exclude_bittorrent ("" = option absent from the config)
+    UCI_EXCLUDE_BITTORRENT="$1"
+    config="$base"
+    sing_box_configure_route
+    printf '%s' "$config"
+}
+
+cfg_absent=$(gen "")
+cfg_off=$(gen "0")
+cfg_on=$(gen "1")
+
+TAG="$SB_BITTORRENT_DIRECT_RULE_TAG"
+DIRECT="$SB_DIRECT_OUTBOUND_TAG"
+TPROXY="$SB_TPROXY_INBOUND_TAG"
+
+# ── Upgrade simulation: option absent from the saved UCI config ─────────────
+echo "$cfg_absent" | jq -e --arg tag "$TAG" \
+    '[.route.rules[] | select(.["__service_tag"] == $tag)] | length == 0' > /dev/null 2>&1 &&
+    echo 'bittorrent-upgrade-absent-no-rule:OK' || echo 'bittorrent-upgrade-absent-no-rule:FAIL'
+
+echo "$cfg_off" | jq -e --arg tag "$TAG" \
+    '[.route.rules[] | select(.["__service_tag"] == $tag)] | length == 0' > /dev/null 2>&1 &&
+    echo 'bittorrent-off-no-rule:OK' || echo 'bittorrent-off-no-rule:FAIL'
+
+# absent == explicit 0, compared through the SAVED artifact because the live
+# config carries random gen_id tags that sing_box_cm_save_config_to_file strips.
+sing_box_cm_save_config_to_file "$cfg_absent" /tmp/bt-absent.json
+sing_box_cm_save_config_to_file "$cfg_off" /tmp/bt-off.json
+sing_box_cm_save_config_to_file "$cfg_on" /tmp/bt-on.json
+if cmp -s /tmp/bt-absent.json /tmp/bt-off.json; then
+    echo 'bittorrent-absent-vs-off-parity:OK'
+else
+    echo 'bittorrent-absent-vs-off-parity:FAIL'
+fi
+
+# ── Option on: rule shape ───────────────────────────────────────────────────
+echo "$cfg_on" | jq -e --arg tag "$TAG" --arg direct "$DIRECT" --arg tproxy "$TPROXY" \
+    '[.route.rules[] | select(.["__service_tag"] == $tag
+        and .action == "route" and .inbound == $tproxy
+        and .protocol == "bittorrent" and .outbound == $direct)] | length == 1' > /dev/null 2>&1 &&
+    echo 'bittorrent-on-rule-shape:OK' || echo 'bittorrent-on-rule-shape:FAIL'
+
+# ── Ordering: strictly after sniff, and directly after it ──────────────────
+echo "$cfg_on" | jq -e --arg tag "$TAG" \
+    '([.route.rules[] | .action] | index("sniff")) as $sniff
+     | ([.route.rules[] | .["__service_tag"]] | index($tag)) as $bt
+     | ($sniff != null) and ($bt != null) and ($bt > $sniff)' > /dev/null 2>&1 &&
+    echo 'bittorrent-on-after-sniff:OK' || echo 'bittorrent-on-after-sniff:FAIL'
+
+echo "$cfg_on" | jq -e --arg tag "$TAG" \
+    '([.route.rules[] | .action] | index("sniff")) as $sniff
+     | ([.route.rules[] | .["__service_tag"]] | index($tag)) as $bt
+     | $bt == ($sniff + 1)' > /dev/null 2>&1 &&
+    echo 'bittorrent-on-immediately-after-sniff:OK' || echo 'bittorrent-on-immediately-after-sniff:FAIL'
+
+# ── Option on is purely additive ───────────────────────────────────────────
+on_without_bt=$(jq -cS '[.route.rules[] | select(.protocol != "bittorrent")]' /tmp/bt-on.json)
+off_all=$(jq -cS '[.route.rules[]]' /tmp/bt-off.json)
+if [ "$on_without_bt" = "$off_all" ]; then
+    echo 'bittorrent-on-purely-additive:OK'
+else
+    echo 'bittorrent-on-purely-additive:FAIL'
+fi
+
+# ── sing-box validation of the SAVED artifact (service tags stripped) ──────
+if command -v sing-box > /dev/null 2>&1; then
+    sing-box -c /tmp/bt-absent.json check > /dev/null 2>&1 &&
+        echo 'bittorrent-absent-singbox-check:OK' || echo 'bittorrent-absent-singbox-check:FAIL'
+    sing-box -c /tmp/bt-on.json check > /dev/null 2>&1 &&
+        echo 'bittorrent-on-singbox-check:OK' || echo 'bittorrent-on-singbox-check:FAIL'
+    jq -e '[.route.rules[] | select(.protocol == "bittorrent")] | length == 1' /tmp/bt-on.json > /dev/null 2>&1 &&
+        echo 'bittorrent-on-survives-save:OK' || echo 'bittorrent-on-survives-save:FAIL'
+else
+    echo 'bittorrent-absent-singbox-check:SKIP'
+    echo 'bittorrent-on-singbox-check:SKIP'
+    echo 'bittorrent-on-survives-save:SKIP'
+fi
+rm -f /tmp/bt-absent.json /tmp/bt-off.json /tmp/bt-on.json
+
+# ── The new manager helper against a bare config ───────────────────────────
+bare='{"route":{"rules":[{"action":"sniff","inbound":"tproxy-in"}],"rule_set":[],"final":"direct-out","auto_detect_interface":true}}'
+out=$(sing_box_cm_add_bittorrent_direct_route_rule "$bare" "bt-tag" "tproxy-in" "direct-out")
+echo "$out" | jq -e '(.route.rules | length) == 2
+    and .route.rules[1].action == "route"
+    and .route.rules[1].protocol == "bittorrent"
+    and .route.rules[1].inbound == "tproxy-in"
+    and .route.rules[1].outbound == "direct-out"
+    and .route.rules[1]["__service_tag"] == "bt-tag"' > /dev/null 2>&1 &&
+    echo 'bittorrent-helper-appends-rule:OK' || echo 'bittorrent-helper-appends-rule:FAIL'
+
+echo 'DONE'
+BTEOF
+    sed -i "s|NETSHIFT_LIB|$NETSHIFT_LIB_DIR|g; s|BIN_PATH|$bin|; s|FACADE_PATH|$facade_lib|" "$drv"
+
+    local bt_out="/tmp/netshift-bittorrent-out-$$.log"
+    ash "$drv" > "$bt_out" 2>&1 || true
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "$line" ;;
+            *:FAIL) fail "$line" ;;
+            *:SKIP) skip "$line" ;;
+            DONE) saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$bt_out"
+    if [ "$saw_done" = "1" ]; then
+        pass "bittorrent-driver-completed:OK"
+    else
+        fail "bittorrent-driver-completed:FAIL (driver aborted early)"
+    fi
+    rm -f "$drv" "$bt_out"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: Stock sing-box update check (task-017)
 # ─────────────────────────────────────────────────────────────────
 # Exercises updates_check_sing_box_stable through the real sourced updater.sh
@@ -8362,6 +8588,7 @@ main() {
             test_dns_via_outbound
             test_sub_url_option
             test_global_proxy
+            test_bittorrent_direct
             test_check_update_stable
             test_check_update_extended
             test_check_update_netshift
@@ -8393,6 +8620,7 @@ main() {
         dnsdetour)   test_dns_via_outbound ;;
         suburlopt)   test_sub_url_option ;;
         globalproxy) test_global_proxy ;;
+        bittorrent)  test_bittorrent_direct ;;
         stablecheck) test_check_update_stable ;;
         extcheck)    test_check_update_extended ;;
         netshiftcheck) test_check_update_netshift ;;
@@ -8406,7 +8634,7 @@ main() {
         sb)          test_sing_box_config ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour suburlopt globalproxy bittorrent stablecheck extcheck netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
             exit 1
             ;;
     esac

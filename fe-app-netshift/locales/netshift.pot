@@ -89,11 +89,11 @@ msgstr ""
 msgid "Available actions"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:480
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:492
 msgid "Block direct connections to known public DoH servers (Cloudflare, Google, Quad9, OpenDNS, AdGuard, Yandex) so apps cannot bypass router DNS filtering."
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:479
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:491
 msgid "Block DoH Servers"
 msgstr ""
 
@@ -121,11 +121,11 @@ msgstr ""
 msgid "By name prefix"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:517
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:529
 msgid "Cache File Path"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:531
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:543
 msgid "Cache file path cannot be empty"
 msgstr ""
 
@@ -186,7 +186,7 @@ msgstr ""
 msgid "Component Manager"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:503
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:515
 msgid "Config File Path"
 msgstr ""
 
@@ -388,11 +388,11 @@ msgstr ""
 msgid "Enable DNS resolve to get real IP when routing"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:491
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:503
 msgid "Enable IPv6 Support"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:492
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:504
 msgid "Enable IPv6 TProxy routing, IPv6 DNS inbound, and IPv6 FakeIP support."
 msgstr ""
 
@@ -470,6 +470,10 @@ msgstr ""
 
 #: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/section.js:184
 msgid "Every hour"
+msgstr ""
+
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:479
+msgid "Exclude BitTorrent"
 msgstr ""
 
 #: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:467
@@ -829,7 +833,7 @@ msgstr ""
 msgid "Local Subnet Lists"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:554
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:566
 msgid "Log Level"
 msgstr ""
 
@@ -951,15 +955,15 @@ msgstr ""
 msgid "Path cannot be empty"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:535
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:547
 msgid "Path must be absolute (start with /)"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:544
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:556
 msgid "Path must contain at least one directory (like /tmp/cache.db)"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:539
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:551
 msgid "Path must end with cache.db"
 msgstr ""
 
@@ -1013,6 +1017,10 @@ msgstr ""
 
 #: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/section.js:464
 msgid "Route all unmatched traffic through this section's outbound."
+msgstr ""
+
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:480
+msgid "Route BitTorrent traffic directly, bypassing the proxy or VPN. Some providers block subscriptions when they detect torrent traffic."
 msgstr ""
 
 #: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:104
@@ -1100,11 +1108,11 @@ msgstr ""
 msgid "Select or enter DNS server address"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:518
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:530
 msgid "Select or enter path for sing-box cache file. Change this ONLY if you know what you are doing"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:504
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:516
 msgid "Select path for sing-box config file. Change this ONLY if you know what you are doing"
 msgstr ""
 
@@ -1112,7 +1120,7 @@ msgstr ""
 msgid "Select the DNS protocol type for the domain resolver"
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:555
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:567
 msgid "Select the log level for sing-box"
 msgstr ""
 
@@ -1440,7 +1448,7 @@ msgstr ""
 msgid "Use only for IP-host panels that serve an invalid or self-signed certificate."
 msgstr ""
 
-#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:494
+#: ../luci-app-netshift/htdocs/luci-static/resources/view/netshift/settings.js:506
 msgid "Use this only when the router has working IPv6 connectivity."
 msgstr ""
 

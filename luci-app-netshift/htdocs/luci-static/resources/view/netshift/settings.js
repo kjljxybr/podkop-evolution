@@ -475,6 +475,18 @@ function createSettingsContent(section) {
   o = section.taboption(
     "advanced",
     form.Flag,
+    "exclude_bittorrent",
+    _("Exclude BitTorrent"),
+    _(
+      "Route BitTorrent traffic directly, bypassing the proxy or VPN. Some providers block subscriptions when they detect torrent traffic.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.taboption(
+    "advanced",
+    form.Flag,
     "block_doh",
     _("Block DoH Servers"),
     _(
