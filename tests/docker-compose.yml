@@ -13,7 +13,8 @@
 #             chunkcheck, diagnostics, subscription, fastest, insecure, rejected,
 #             jobstate, selfheal, dnsdetour, ecssubnet, suburlopt, subcron, globalproxy,
 #             bittorrent, stablecheck, extcheck, sbextarch, netshiftcheck, latesttag,
-#             ghredirect, selfupdate, backupguard, hotreload, domsep, domcase
+#             ghredirect, selfupdate, backupguard, hotreload, cachepersist,
+#             domsep, domcase
 # ──────────────────────────────────────────────────────────────────
 
 services:

@@ -885,6 +885,103 @@ start_subscription_startup_retry_worker() {
     log "Started deferred startup recovery worker with PID $!" "warn"
 }
 
+# --- selected server survives a reboot ---------------------------------------
+# sing-box stores the server picked in a selector in its cache DB and loads it on
+# start, but the DB lives on tmpfs. NETSHIFT_CACHE_BACKUP is a copy on flash,
+# taken when the selection changes and put back before sing-box starts.
+
+get_sing_box_cache_path() {
+    local cache_path
+    config_get cache_path "settings" "cache_path" "/tmp/sing-box/cache.db"
+    printf '%s' "$cache_path"
+}
+
+# A cache_path on flash already survives a reboot and needs no copy.
+sing_box_cache_is_volatile() {
+    case "$1" in
+    /tmp/* | /var/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Put the copy back only when the live DB is missing (tmpfs was wiped). A live DB
+# that survived a restart is newer than any copy.
+restore_sing_box_cache() {
+    local cache_path
+    cache_path="$(get_sing_box_cache_path)"
+    sing_box_cache_is_volatile "$cache_path" || return 0
+    [ -e "$cache_path" ] && return 0
+    [ -f "$NETSHIFT_CACHE_BACKUP" ] || return 0
+
+    mkdir -p "$(dirname "$cache_path")"
+    if cp "$NETSHIFT_CACHE_BACKUP" "$cache_path" 2> /dev/null; then
+        log "Restored sing-box cache from $NETSHIFT_CACHE_BACKUP (selected servers kept after reboot)" "info"
+    else
+        rm -f "$cache_path"
+        log "Failed to restore sing-box cache from $NETSHIFT_CACHE_BACKUP" "warn"
+    fi
+}
+
+# Prints "group<TAB>selected" for every selector of the running sing-box, sorted.
+# Prints nothing when the Clash API does not answer. It resolves the controller
+# address without get_service_listen_address, which logs on every call and runs
+# here once a minute from the monitor.
+get_sing_box_selection() {
+    local address secret auth_header=""
+    config_get address "settings" "service_listen_address"
+    [ -n "$address" ] || network_get_ipaddr address "lan"
+    [ -n "$address" ] || address="127.0.0.1"
+    config_get secret "settings" "yacd_secret_key"
+    [ -n "$secret" ] && auth_header="Authorization: Bearer $secret"
+
+    curl -m 3 -s --header "$auth_header" "http://$address:$SB_CLASH_API_CONTROLLER_PORT/proxies" 2> /dev/null |
+        jq -r '.proxies // {} | to_entries[] | select(.value.type == "Selector")
+            | "\(.key)\t\(.value.now // "")"' 2> /dev/null |
+        sort
+}
+
+# Copy the live cache DB to flash if the selection differs from the one the
+# current copy was taken with. sing-box keeps writing the DB (FakeIP, rule-set
+# cache), so a copy is kept only when it still matches the live file afterwards;
+# a torn bbolt copy could crash sing-box on every boot.
+snapshot_sing_box_cache() {
+    local cache_path
+    cache_path="$(get_sing_box_cache_path)"
+    sing_box_cache_is_volatile "$cache_path" || return 0
+    [ -f "$cache_path" ] || return 0
+
+    mkdir -p "$(dirname "$NETSHIFT_CACHE_BACKUP_LOCK")" "$NETSHIFT_STATE_DIR"
+    (
+        flock 9 || exit 0
+
+        selection="$(get_sing_box_selection)"
+        [ -n "$selection" ] || exit 0
+        if [ -f "$NETSHIFT_CACHE_BACKUP" ] &&
+            [ "$selection" = "$(cat "$NETSHIFT_CACHE_SELECTION" 2> /dev/null)" ]; then
+            exit 0
+        fi
+
+        tmp="$NETSHIFT_CACHE_BACKUP.tmp"
+        attempt=1
+        while [ "$attempt" -le 3 ]; do
+            if cp "$cache_path" "$tmp" 2> /dev/null && cmp -s "$cache_path" "$tmp"; then
+                chmod 600 "$tmp"
+                printf '%s' "$selection" > "$NETSHIFT_CACHE_SELECTION.tmp"
+                if mv "$tmp" "$NETSHIFT_CACHE_BACKUP" &&
+                    mv "$NETSHIFT_CACHE_SELECTION.tmp" "$NETSHIFT_CACHE_SELECTION"; then
+                    log "Saved sing-box cache with the selected servers to $NETSHIFT_CACHE_BACKUP" "info"
+                    exit 0
+                fi
+                break
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        rm -f "$tmp" "$NETSHIFT_CACHE_SELECTION.tmp"
+        log "Could not copy $cache_path to $NETSHIFT_CACHE_BACKUP, will retry on the next check" "warn"
+    ) 9> "$NETSHIFT_CACHE_BACKUP_LOCK"
+}
+
 start_main() {
     log "Starting netshift"
 
@@ -933,6 +1030,7 @@ start_main() {
     rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
     config_foreach add_cron_job "section"
     sync_subscription_cron_jobs
+    restore_sing_box_cache
     /etc/init.d/sing-box start
 
     if [ "$subscription_startup_blocked" -ne 0 ]; then
@@ -1147,6 +1245,7 @@ stop() {
 monitor_sing_box() {
     local crash_count=0
     local backoff=0
+    local snapshot_wait=0
     local dont_touch_dhcp
 
     # Record our OWN pid (task-035): the monitor runs detached via setsid, so
@@ -1160,6 +1259,12 @@ monitor_sing_box() {
         if sing_box_process_exists; then
             crash_count=0
             backoff=0
+            # A server picked in the Clash dashboard bypasses clash_api.
+            snapshot_wait=$((snapshot_wait + MONITOR_CHECK_INTERVAL))
+            if [ "$snapshot_wait" -ge "$MONITOR_CACHE_SNAPSHOT_INTERVAL" ]; then
+                snapshot_wait=0
+                snapshot_sing_box_cache
+            fi
             continue
         fi
 
@@ -5170,6 +5275,8 @@ clash_api() {
         case "$http_code" in
         204)
             jq -n --arg group "$group_tag" --arg proxy "$proxy_tag" '{success:true,group:$group,proxy:$proxy}'
+            # sing-box has stored the pick in its cache DB before answering.
+            snapshot_sing_box_cache > /dev/null 2>&1
             ;;
         404)
             jq -n --arg group "$group_tag" '{success:false,error:"group_not_found",message:($group + " does not exist")}'

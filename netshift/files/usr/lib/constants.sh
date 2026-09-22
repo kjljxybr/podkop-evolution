@@ -5,6 +5,14 @@ NETSHIFT_VERSION="__COMPILED_VERSION_VARIABLE__"
 ## Common
 NETSHIFT_CONFIG="/etc/config/netshift"
 NETSHIFT_STATE_DIR="/etc/netshift"
+# The live sing-box cache DB (settings.cache_path, /tmp/sing-box/cache.db by
+# default) is on tmpfs, and it is where sing-box keeps the server picked in a
+# selector. The DB is copied to flash when the selection changes and put back
+# before sing-box starts after a reboot. The selection file holds the choice the
+# copy was taken with, so FakeIP churn never causes a flash write.
+NETSHIFT_CACHE_BACKUP="$NETSHIFT_STATE_DIR/cache.db"
+NETSHIFT_CACHE_SELECTION="$NETSHIFT_STATE_DIR/cache.db.selection"
+NETSHIFT_CACHE_BACKUP_LOCK="/var/lock/netshift-cache-backup.lock"
 RESOLV_CONF="/etc/resolv.conf"
 DNS_RESOLVERS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.11 94.140.14.14 94.140.15.15 208.67.220.220 208.67.222.222 77.88.8.1 77.88.8.8"
 CHECK_PROXY_IP_DOMAIN="ip.podkop.fyi"
@@ -100,6 +108,8 @@ NFT_OUTBOUND_MARK="0x00200000"
 SB_REQUIRED_VERSION="1.12.0"
 # Monitoring
 MONITOR_CHECK_INTERVAL=10
+# How often the monitor looks for a server picked outside LuCI (Clash dashboard).
+MONITOR_CACHE_SNAPSHOT_INTERVAL=60
 MONITOR_MAX_CRASHES=5
 MONITOR_BACKOFF_BASE=10
 MONITOR_BACKOFF_MAX=300

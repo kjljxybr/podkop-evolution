@@ -10455,6 +10455,263 @@ DSEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: selected server survives a reboot (sing-box cache DB copy)
+# ─────────────────────────────────────────────────────────────────
+test_cache_persist() {
+    header "Selected Server Survives Reboot (sing-box cache DB copy)"
+
+    if ! command -v jq > /dev/null 2>&1; then
+        skip "jq not available"
+        return
+    fi
+    if ! command -v flock > /dev/null 2>&1 || ! command -v cmp > /dev/null 2>&1; then
+        skip "flock / cmp not available"
+        return
+    fi
+
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    local lib="${NETSHIFT_LIB_DIR}"
+    if [ ! -r "$bin" ] || [ ! -r "$lib/constants.sh" ]; then
+        skip "netshift bin / constants.sh not found"
+        return
+    fi
+
+    local drv="/tmp/netshift-cachepersist-$$.sh"
+    local out="/tmp/netshift-cachepersist-$$.out"
+    cat > "$drv" << 'CPEOF'
+. "LIB_DIR/constants.sh"
+
+# Functions under test come VERBATIM from the shipped bin.
+extract() {
+    awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH"
+}
+eval "$(extract get_sing_box_cache_path)"
+eval "$(extract sing_box_cache_is_volatile)"
+eval "$(extract restore_sing_box_cache)"
+eval "$(extract get_sing_box_selection)"
+eval "$(extract snapshot_sing_box_cache)"
+eval "$(extract monitor_sing_box)"
+
+CP_DIR="/tmp/netshift-cachepersist-state-$$"
+rm -rf "$CP_DIR"
+mkdir -p "$CP_DIR/state"
+NETSHIFT_STATE_DIR="$CP_DIR/state"
+NETSHIFT_CACHE_BACKUP="$NETSHIFT_STATE_DIR/cache.db"
+NETSHIFT_CACHE_SELECTION="$NETSHIFT_STATE_DIR/cache.db.selection"
+NETSHIFT_CACHE_BACKUP_LOCK="$CP_DIR/lock/cache-backup.lock"
+LIVE="$CP_DIR/live/cache.db"
+LOG="$CP_DIR/log"
+
+log() { printf '%s %s\n' "${2:-info}" "$1" >> "$LOG"; }
+CFG_CACHE_PATH="$LIVE"
+CFG_LISTEN=""
+CFG_SECRET=""
+CFG_LAN_IP="192.168.1.1"
+config_get() {
+    local __v=""
+    case "$3" in
+    cache_path) __v="$CFG_CACHE_PATH" ;;
+    service_listen_address) __v="$CFG_LISTEN" ;;
+    yacd_secret_key) __v="$CFG_SECRET" ;;
+    shutdown_correctly) __v="1" ;;
+    esac
+    [ -n "$__v" ] || __v="$4"
+    eval "$1=\$__v"
+}
+config_load() { :; }
+network_get_ipaddr() { eval "$1=\$CFG_LAN_IP"; }
+
+reset_state() {
+    rm -rf "$CP_DIR/live" "$NETSHIFT_STATE_DIR" "$LOG"
+    mkdir -p "$NETSHIFT_STATE_DIR"
+    CFG_CACHE_PATH="$LIVE"
+}
+live_db() {
+    mkdir -p "$(dirname "$LIVE")"
+    printf '%s' "$1" > "$LIVE"
+}
+check() {
+    if eval "$2"; then echo "$1:OK"; else echo "$1:FAIL"; fi
+}
+
+# ── restore_sing_box_cache ─────────────────────────────────────────────
+# R1: no copy on flash -> nothing is created.
+reset_state
+restore_sing_box_cache
+check cp-restore-without-copy-noop '[ ! -e "$LIVE" ]'
+
+# R2: reboot wiped tmpfs -> the copy becomes the live DB.
+reset_state
+printf 'saved-db' > "$NETSHIFT_CACHE_BACKUP"
+restore_sing_box_cache
+check cp-restore-after-reboot '[ "$(cat "$LIVE" 2>/dev/null)" = "saved-db" ]'
+
+# R3: a live DB that survived a restart is newer -> left alone.
+reset_state
+printf 'saved-db' > "$NETSHIFT_CACHE_BACKUP"
+live_db 'live-db'
+restore_sing_box_cache
+check cp-restore-keeps-live-db '[ "$(cat "$LIVE")" = "live-db" ]'
+
+# R4: cache_path on flash survives a reboot by itself -> no copy is used.
+reset_state
+printf 'saved-db' > "$NETSHIFT_CACHE_BACKUP"
+CFG_CACHE_PATH="$CP_DIR/flash/cache.db"
+sing_box_cache_is_volatile() { return 1; }
+restore_sing_box_cache
+eval "$(extract sing_box_cache_is_volatile)"
+check cp-restore-skips-flash-cache-path '[ ! -e "$CP_DIR/flash/cache.db" ]'
+
+# ── sing_box_cache_is_volatile ─────────────────────────────────────────
+check cp-volatile-tmp 'sing_box_cache_is_volatile /tmp/sing-box/cache.db'
+check cp-volatile-var 'sing_box_cache_is_volatile /var/run/sing-box/cache.db'
+check cp-flash-not-volatile '! sing_box_cache_is_volatile /etc/sing-box/cache.db'
+
+# ── get_sing_box_selection ─────────────────────────────────────────────
+PROXIES='{"proxies":{
+  "main-out":{"type":"Selector","now":"node-b","all":["node-a","node-b"]},
+  "alt-out":{"type":"Selector","now":"node-c"},
+  "main-urltest-out":{"type":"URLTest","now":"node-a"},
+  "direct-out":{"type":"Direct"}}}'
+CURL_ARGS="$CP_DIR/curl.args"
+curl() { printf '%s\n' "$@" > "$CURL_ARGS"; printf '%s' "$PROXIES"; }
+
+sel="$(get_sing_box_selection)"
+expected="$(printf 'alt-out\tnode-c\nmain-out\tnode-b')"
+check cp-selection-lists-selectors-only '[ "$sel" = "$expected" ]'
+check cp-selection-uses-lan-address 'grep -qx "http://192.168.1.1:$SB_CLASH_API_CONTROLLER_PORT/proxies" "$CURL_ARGS"'
+check cp-selection-no-auth-without-secret '! grep -q "Authorization" "$CURL_ARGS"'
+
+CFG_SECRET="s3cret"
+CFG_LISTEN="10.0.0.1"
+get_sing_box_selection > /dev/null
+check cp-selection-sends-secret 'grep -qx "Authorization: Bearer s3cret" "$CURL_ARGS"'
+check cp-selection-honours-listen-override 'grep -q "^http://10.0.0.1:" "$CURL_ARGS"'
+CFG_SECRET=""
+CFG_LISTEN=""
+
+curl() { return 7; }
+check cp-selection-empty-when-api-down '[ -z "$(get_sing_box_selection)" ]'
+
+# ── snapshot_sing_box_cache ────────────────────────────────────────────
+SELECTION="$(printf 'main-out\tnode-b')"
+get_sing_box_selection() { [ -n "$SELECTION" ] && printf '%s\n' "$SELECTION"; }
+
+# S1: no live DB yet -> nothing to copy.
+reset_state
+snapshot_sing_box_cache
+check cp-snapshot-without-live-db-noop '[ ! -e "$NETSHIFT_CACHE_BACKUP" ]'
+
+# S2: Clash API down -> the selection is unknown, keep what is on flash.
+reset_state
+live_db 'db-1'
+SELECTION=""
+snapshot_sing_box_cache
+SELECTION="$(printf 'main-out\tnode-b')"
+check cp-snapshot-api-down-noop '[ ! -e "$NETSHIFT_CACHE_BACKUP" ]'
+
+# S3: first selection -> byte-identical copy, selection recorded, mode 600.
+reset_state
+live_db 'db-1'
+snapshot_sing_box_cache
+check cp-snapshot-copies-live-db 'cmp -s "$LIVE" "$NETSHIFT_CACHE_BACKUP"'
+check cp-snapshot-records-selection '[ "$(cat "$NETSHIFT_CACHE_SELECTION")" = "$SELECTION" ]'
+check cp-snapshot-mode-600 '[ "$(ls -l "$NETSHIFT_CACHE_BACKUP" | cut -c1-10)" = "-rw-------" ]'
+check cp-snapshot-no-leftover-tmp '[ ! -e "$NETSHIFT_CACHE_BACKUP.tmp" ] && [ ! -e "$NETSHIFT_CACHE_SELECTION.tmp" ]'
+
+# S4: same selection, DB changed by FakeIP -> no flash write.
+live_db 'db-2-fakeip-churn'
+snapshot_sing_box_cache
+check cp-snapshot-same-selection-no-write '[ "$(cat "$NETSHIFT_CACHE_BACKUP")" = "db-1" ]'
+
+# S5: selection changed -> copy retaken.
+SELECTION="$(printf 'main-out\tnode-a')"
+snapshot_sing_box_cache
+check cp-snapshot-new-selection-rewrites '[ "$(cat "$NETSHIFT_CACHE_BACKUP")" = "db-2-fakeip-churn" ] && [ "$(cat "$NETSHIFT_CACHE_SELECTION")" = "$SELECTION" ]'
+
+# S6: copy from 0.9.3/0.9.4 without a selection file -> retaken once.
+reset_state
+live_db 'db-3'
+printf 'legacy-db' > "$NETSHIFT_CACHE_BACKUP"
+snapshot_sing_box_cache
+check cp-snapshot-legacy-copy-retaken '[ "$(cat "$NETSHIFT_CACHE_BACKUP")" = "db-3" ] && [ -f "$NETSHIFT_CACHE_SELECTION" ]'
+
+# S7: sing-box writes the DB during every copy -> old copy kept, no torn file.
+reset_state
+live_db 'db-4'
+printf 'good-db' > "$NETSHIFT_CACHE_BACKUP"
+cp() { command cp "$@"; printf 'x' >> "$LIVE"; }
+sleep() { :; }
+snapshot_sing_box_cache
+unset -f cp sleep
+check cp-snapshot-unstable-keeps-old-copy '[ "$(cat "$NETSHIFT_CACHE_BACKUP")" = "good-db" ] && [ ! -f "$NETSHIFT_CACHE_SELECTION" ]'
+check cp-snapshot-unstable-no-leftover-tmp '[ ! -e "$NETSHIFT_CACHE_BACKUP.tmp" ]'
+check cp-snapshot-unstable-logs-warn 'grep -q "^warn Could not copy" "$LOG"'
+
+# S8: sing-box writes during the first copy only -> the retry succeeds.
+reset_state
+live_db 'db-5'
+CP_CALLS=0
+cp() { command cp "$@"; CP_CALLS=$((CP_CALLS + 1)); [ "$CP_CALLS" -eq 1 ] && printf 'y' >> "$LIVE"; return 0; }
+sleep() { :; }
+snapshot_sing_box_cache
+unset -f cp sleep
+check cp-snapshot-retry-after-write '[ "$(cat "$NETSHIFT_CACHE_BACKUP")" = "db-5y" ]'
+
+# S9: cache_path on flash -> nothing copied.
+reset_state
+CFG_CACHE_PATH="$CP_DIR/flash/cache.db"
+mkdir -p "$CP_DIR/flash"
+printf 'flash-db' > "$CFG_CACHE_PATH"
+sing_box_cache_is_volatile() { return 1; }
+snapshot_sing_box_cache
+eval "$(extract sing_box_cache_is_volatile)"
+check cp-snapshot-skips-flash-cache-path '[ ! -e "$NETSHIFT_CACHE_BACKUP" ]'
+
+# ── monitor_sing_box: periodic check catches dashboard picks ───────────
+# Seven healthy 10 s ticks, then sing-box is gone and the stop was clean.
+MONITOR_PIDFILE="$CP_DIR/monitor.pid"
+MONITOR_CHECK_INTERVAL=10
+MONITOR_CACHE_SNAPSHOT_INTERVAL=60
+TICKS=0
+SNAPSHOTS=0
+sleep() { :; }
+sing_box_process_exists() { TICKS=$((TICKS + 1)); [ "$TICKS" -le 7 ]; }
+snapshot_sing_box_cache() { SNAPSHOTS=$((SNAPSHOTS + 1)); }
+monitor_sing_box
+check cp-monitor-snapshots-once-per-minute '[ "$SNAPSHOTS" = "1" ]'
+
+# ── wiring in the shipped bin ──────────────────────────────────────────
+start_body="$(extract start_main)"
+check cp-start-restores-before-sing-box 'printf "%s\n" "$start_body" | awk "/restore_sing_box_cache/{r=NR} /\\/etc\\/init.d\\/sing-box start/{s=NR} END{exit !(r && s && r < s)}"'
+check cp-set-group-proxy-snapshots 'extract clash_api | awk "/^        204\\)/{p=1} p&&/;;/{exit} p" | grep -q "snapshot_sing_box_cache"'
+check cp-stop-does-not-snapshot '! extract stop_main | grep -q "snapshot_sing_box_cache"'
+
+rm -rf "$CP_DIR"
+echo DONE
+CPEOF
+    sed -i -e "s|BIN_PATH|$bin|g" -e "s|LIB_DIR|$lib|g" "$drv"
+
+    sh "$drv" > "$out" 2>&1 || true
+
+    local line saw_done=0
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "${line%:OK}" ;;
+            *:FAIL) fail "$line" ;;
+            DONE) saw_done=1 ;;
+        esac
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "cp-driver-completed"
+    else
+        fail "cp-driver-completed:FAIL (driver aborted early)" "$(tail -5 "$out" 2>/dev/null)"
+    fi
+
+    rm -f "$drv" "$out"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────
 main() {
@@ -10508,6 +10765,7 @@ main() {
             test_backup_integrity
             test_hot_reload
             test_domain_separators
+            test_cache_persist
             ;;
         deps)        test_deps ;;
         syntax)      test_syntax ;;
@@ -10545,13 +10803,14 @@ main() {
         backupguard) test_backup_integrity ;;
         hotreload)   test_hot_reload ;;
         domsep)      test_domain_separators ;;
+        cachepersist) test_cache_persist ;;
         jq)          test_jq_helpers ;;
         cm)          test_config_manager ;;
         sb)          test_sing_box_config ;;
         proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour ecssubnet suburlopt subcron globalproxy bittorrent stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour ecssubnet suburlopt subcron globalproxy bittorrent stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload cachepersist"
             exit 1
             ;;
     esac
