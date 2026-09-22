@@ -13,6 +13,17 @@ config settings 'settings'
         option disable_quic '0'
         option update_interval '1d'
         option download_lists_via_proxy '0'
+        # sing-box-extended build to install on 32-bit ARM:
+        # auto | armv7 | armv6 | openwrt.
+        # 'auto' (the default, and also the behaviour when the option is absent,
+        # e.g. on a router upgraded from an older NetShift) picks the build the
+        # CPU can actually run: armv7 (needs VFPv3) where available, armv6 (needs
+        # VFP) on older cores, and on CPUs with no floating point hardware at all
+        # — e.g. Broadcom BCM5301X / Asus RT-AC88U, where the generic ARM builds
+        # die with "Illegal instruction" — the OpenWrt package built for this
+        # target (GOARM=5, software floating point).
+        # Force one of the four values only if the detection picks wrong.
+        option sing_box_extended_arm_build 'auto'
         #option dns_via_outbound '0'
         #option dns_outbound_section 'main'
         option dont_touch_dhcp '0'

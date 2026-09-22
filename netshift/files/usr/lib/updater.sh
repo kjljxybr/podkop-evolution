@@ -5,6 +5,12 @@
 # This file is sourced from /usr/bin/netshift, so log() is available.
 
 SB_EXT_ARCH_SUFFIX=""
+# How the selected asset has to be unpacked: "tarball" for the generic
+# linux-<arch>.tar.gz releases, "openwrt-package" for the OpenWrt .ipk (a tar.gz
+# holding data.tar.gz). Set by updates_resolve_sing_box_extended_arch_suffix.
+SB_EXT_ASSET_KIND="tarball"
+# Human-readable reason why no compatible build could be selected ("" otherwise).
+SB_EXT_ARCH_ERROR=""
 UPDATES_SING_BOX_EXTENDED_REPO="shtorm-7/sing-box-extended"
 
 # Async component-action job state. State lives on tmpfs (/var/run): it survives
@@ -485,10 +491,135 @@ updates_read_openwrt_release_value() {
     sed -n "s/^${key}='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null | head -n 1
 }
 
-# Resolves the sing-box-extended release asset arch suffix into SB_EXT_ARCH_SUFFIX.
-# Returns 1 if the architecture is unsupported.
+# Echoes the CPU feature tokens from /proc/cpuinfo ("Features : half thumb ..."),
+# or nothing when the kernel does not expose them.
+updates_read_cpu_features() {
+    sed -n 's/^Features[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n 1
+}
+
+# True when the space-separated feature list $2 contains the token $1.
+updates_cpu_has_feature() {
+    case " $2 " in
+    *" $1 "*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# Selects the sing-box-extended build for a 32-bit ARM host. Sets
+# SB_EXT_ARCH_SUFFIX + SB_EXT_ASSET_KIND, or SB_EXT_ARCH_ERROR and returns 1
+# when no build compatible with this CPU exists.
+#
+# Every Go build of sing-box needs floating point HARDWARE, and which one it
+# needs is fixed at compile time:
+#   * GOARM=7 — the generic "armv7" asset — requires VFPv3/VFPv4. On an ARMv7
+#     core without them the hard-float binary dies immediately (the reported
+#     "Illegal instruction" on the Asus RT-AC88U / Broadcom BCM5301X, whose
+#     /proc/cpuinfo lists "half thumb fastmult edsp tls" and no vfp token).
+#   * GOARM=6 — the generic "armv6" asset — requires VFPv1/VFPv2, so it does NOT
+#     rescue such a CPU either (runtime.checkgoarm exits when HWCAP_VFP is 0).
+#   * GOARM=5 is pure software floating point and runs on any of them, but
+#     shtorm-7 publishes it for OpenWrt targets only: the openwrt_<arch>
+#     packages are built by the OpenWrt SDK with the target's own GOARM, which
+#     is 5 for the no-VFP ARM targets (e.g. arm_cortex-a9 = bcm53xx). That is
+#     the build that "runs fine" on the reporter's router while every generic
+#     ARM asset fails.
+# So a CPU with no FPU at all is served by the OpenWrt package asset, which is
+# also a tar.gz we can unpack (see updates_extract_sing_box_binary).
+#
+# $1 is the host arch (armv7* / armv6*), used as the default when the CPU
+# feature list cannot be read — unknown hardware keeps the build it got before
+# this check existed, so an upgrade never changes a working router.
+#
+# sing_box_extended_arm_build (settings, default "auto") is the escape hatch for
+# a misdetected CPU: "armv7"/"armv6" force that tarball, "openwrt" forces the
+# OpenWrt package asset, "auto" (and anything else, including an option that is
+# absent because the router was upgraded from an older NetShift) detects. The
+# option is read WITH a default, and an absent one only ever means "detect".
+updates_sing_box_extended_arm_asset() {
+    local host_arch="$1"
+    local features forced distrib_arch
+
+    SB_EXT_ASSET_KIND="tarball"
+    SB_EXT_ARCH_ERROR=""
+
+    config_get forced "settings" "sing_box_extended_arm_build" "auto"
+
+    case "$forced" in
+    armv7)
+        SB_EXT_ARCH_SUFFIX="armv7"
+        return 0
+        ;;
+    armv6)
+        SB_EXT_ARCH_SUFFIX="armv6"
+        return 0
+        ;;
+    openwrt)
+        distrib_arch="$(updates_read_openwrt_release_value "DISTRIB_ARCH")"
+        if [ -z "$distrib_arch" ]; then
+            SB_EXT_ARCH_ERROR="sing_box_extended_arm_build is set to openwrt but DISTRIB_ARCH is unknown"
+            return 1
+        fi
+        SB_EXT_ASSET_KIND="openwrt-package"
+        SB_EXT_ARCH_SUFFIX="$distrib_arch"
+        return 0
+        ;;
+    esac
+
+    features="$(updates_read_cpu_features)"
+    if [ -z "$features" ]; then
+        case "$host_arch" in
+        armv6*) SB_EXT_ARCH_SUFFIX="armv6" ;;
+        *) SB_EXT_ARCH_SUFFIX="armv7" ;;
+        esac
+        return 0
+    fi
+
+    case "$host_arch" in
+    armv6*)
+        # ARMv6 hosts keep the armv6 asset they always got; only a CPU without
+        # any floating point hardware needs the OpenWrt build instead.
+        if updates_cpu_has_feature "vfp" "$features"; then
+            SB_EXT_ARCH_SUFFIX="armv6"
+            return 0
+        fi
+        ;;
+    *)
+        if updates_cpu_has_feature "vfpv3" "$features" ||
+            updates_cpu_has_feature "vfpv3d16" "$features" ||
+            updates_cpu_has_feature "vfpv4" "$features"; then
+            SB_EXT_ARCH_SUFFIX="armv7"
+            return 0
+        fi
+
+        if updates_cpu_has_feature "vfp" "$features"; then
+            SB_EXT_ARCH_SUFFIX="armv6"
+            return 0
+        fi
+        ;;
+    esac
+
+    distrib_arch="$(updates_read_openwrt_release_value "DISTRIB_ARCH")"
+    if [ -z "$distrib_arch" ]; then
+        SB_EXT_ARCH_ERROR="this CPU has no floating point hardware, so it cannot run any generic ARM build, and DISTRIB_ARCH is unknown so the OpenWrt build cannot be selected"
+        return 1
+    fi
+
+    updates_log "CPU has no floating point hardware; using the OpenWrt ($distrib_arch) sing-box-extended package instead of the generic ARM tarball" "warn"
+    SB_EXT_ASSET_KIND="openwrt-package"
+    SB_EXT_ARCH_SUFFIX="$distrib_arch"
+    return 0
+}
+
+# Resolves the sing-box-extended release asset arch suffix into SB_EXT_ARCH_SUFFIX
+# (plus SB_EXT_ASSET_KIND / SB_EXT_ARCH_ERROR, see
+# updates_sing_box_extended_arm_asset). Returns 1 if the architecture is
+# unsupported or no build compatible with the CPU exists.
 updates_resolve_sing_box_extended_arch_suffix() {
     local host_arch distrib_arch
+
+    SB_EXT_ASSET_KIND="tarball"
+    SB_EXT_ARCH_ERROR=""
 
     host_arch="$(uname -m 2>/dev/null || true)"
     distrib_arch="$(updates_read_openwrt_release_value "DISTRIB_ARCH")"
@@ -500,8 +631,7 @@ updates_resolve_sing_box_extended_arch_suffix() {
 
     case "$host_arch" in
     aarch64) SB_EXT_ARCH_SUFFIX="arm64" ;;
-    armv7*) SB_EXT_ARCH_SUFFIX="armv7" ;;
-    armv6*) SB_EXT_ARCH_SUFFIX="armv6" ;;
+    armv7* | armv6*) updates_sing_box_extended_arm_asset "$host_arch" || return 1 ;;
     x86_64) SB_EXT_ARCH_SUFFIX="amd64" ;;
     i386 | i686) SB_EXT_ARCH_SUFFIX="386" ;;
     mips) SB_EXT_ARCH_SUFFIX="mips-softfloat" ;;
@@ -622,6 +752,25 @@ updates_extended_asset_url() {
     local rel="$1"
     local suffix url
 
+    if [ "$SB_EXT_ASSET_KIND" = "openwrt-package" ]; then
+        # The .ipk is used even on apk systems: it is a plain tar.gz that busybox
+        # tar can stream (see updates_extract_sing_box_binary), while the apk v3
+        # container cannot be unpacked without apk-tools itself. The payload is
+        # the same GOARM=5 binary either way.
+        suffix="openwrt_${SB_EXT_ARCH_SUFFIX}.ipk"
+        url="$(printf '%s' "$rel" | jq -r --arg s "$suffix" '
+            .assets // []
+            | map(select(.name != null and (.name | endswith($s))))
+            | .[0].browser_download_url // empty
+        ' 2>/dev/null)"
+        if [ -n "$url" ]; then
+            printf '%s' "$url"
+            return 0
+        fi
+
+        return 1
+    fi
+
     if updates_system_uses_musl; then
         suffix="linux-${SB_EXT_ARCH_SUFFIX}-musl.tar.gz"
         url="$(printf '%s' "$rel" | jq -r --arg s "$suffix" '
@@ -647,6 +796,61 @@ updates_extended_asset_url() {
     fi
 
     return 1
+}
+
+# Echoes the name of the member holding sing-box inside $1, or nothing when the
+# archive does not contain one. For the OpenWrt .ipk the binary sits one level
+# deeper (data.tar.gz -> ./usr/bin/sing-box), so the data member is what has to
+# be located here; updates_extract_sing_box_binary unpacks the rest.
+updates_extended_archive_binary_member() {
+    local archive="$1"
+
+    if [ "$SB_EXT_ASSET_KIND" = "openwrt-package" ]; then
+        tar -tzf "$archive" 2>/dev/null | grep -E '(^|/)data\.tar\.gz$' | sed -n '1p'
+        return 0
+    fi
+
+    tar -tzf "$archive" 2>/dev/null | grep -E '(^|/)sing-box$' | sed -n '1p'
+}
+
+# Writes the sing-box binary from the downloaded archive $1 to $2.
+#
+# Disk-space note: both layouts are unpacked as STREAMS, so the only copy that
+# ever reaches disk is the binary being installed — the same rule the rest of
+# this installer follows (tmpfs holds the archive and the backup; the overlay is
+# too small for a second copy).
+#
+# Returns non-zero when nothing usable was written: an archive without a
+# sing-box member, or an extraction that produced an empty file.
+updates_extract_sing_box_binary() {
+    local archive="$1"
+    local dest="$2"
+    local data_member member
+
+    rm -f "$dest"
+
+    if [ "$SB_EXT_ASSET_KIND" = "openwrt-package" ]; then
+        data_member="$(updates_extended_archive_binary_member "$archive")"
+        [ -n "$data_member" ] || return 1
+
+        # OpenWrt's buildroot writes the payload as ./usr/bin/sing-box; the
+        # unprefixed form is tried as well so a differently built package file
+        # does not turn into a silent empty install.
+        for member in "./usr/bin/sing-box" "usr/bin/sing-box"; do
+            tar -xzf "$archive" -O "$data_member" 2>/dev/null |
+                tar -xzO -f - "$member" > "$dest" 2>/dev/null
+            [ -s "$dest" ] && return 0
+            rm -f "$dest"
+        done
+
+        return 1
+    fi
+
+    member="$(updates_extended_archive_binary_member "$archive")"
+    [ -n "$member" ] || return 1
+
+    tar -xzf "$archive" -O "$member" > "$dest" 2>/dev/null
+    [ -s "$dest" ]
 }
 
 # Downloads a URL to a file path (curl, fall back to wget). Returns 0 on success.
@@ -975,8 +1179,13 @@ _updates_install_sing_box_extended_core() {
     fi
 
     if ! updates_resolve_sing_box_extended_arch_suffix; then
-        updates_log "Unsupported architecture for sing-box-extended" "error"
-        echo "{\"success\":false,\"message\":\"Unsupported architecture for sing-box-extended\"}"
+        if [ -n "$SB_EXT_ARCH_ERROR" ]; then
+            updates_log "No compatible sing-box-extended build: $SB_EXT_ARCH_ERROR" "error"
+            echo "{\"success\":false,\"message\":\"No sing-box-extended build compatible with this CPU: $SB_EXT_ARCH_ERROR\"}"
+        else
+            updates_log "Unsupported architecture for sing-box-extended" "error"
+            echo "{\"success\":false,\"message\":\"Unsupported architecture for sing-box-extended\"}"
+        fi
         return 1
     fi
 
@@ -1024,7 +1233,7 @@ _updates_install_sing_box_extended_core() {
         return 1
     fi
 
-    binary_path="$(tar -tzf "$archive" 2>/dev/null | grep -E '(^|/)sing-box$' | sed -n '1p')"
+    binary_path="$(updates_extended_archive_binary_member "$archive")"
     if [ -z "$binary_path" ]; then
         rm -rf "$tmp_dir"
         updates_log "sing-box binary not found in archive" "error"
@@ -1066,7 +1275,7 @@ _updates_install_sing_box_extended_core() {
     # stream the new member straight onto the final path (never two binaries
     # on overlay at once). Restore from the tmpfs backup on any failure.
     rm -f /usr/bin/sing-box
-    if ! tar -xzf "$archive" -O "$binary_path" > /usr/bin/sing-box 2>/dev/null || [ ! -s /usr/bin/sing-box ]; then
+    if ! updates_extract_sing_box_binary "$archive" /usr/bin/sing-box; then
         rm -f /usr/bin/sing-box
         # Only restore from a backup that is still byte-complete — restoring a
         # truncated backup would install a segfaulting core as the "safe"
