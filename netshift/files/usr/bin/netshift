@@ -835,6 +835,7 @@ start_subscription_startup_retry_worker() {
 
     (
         trap 'rm -f "'"$pidfile"'"' EXIT INT TERM
+        apply_failures=0
 
         # Let the primary sing-box instance come up first, so a configured
         # service proxy can be used for the post-bootstrap refresh.
@@ -843,18 +844,40 @@ start_subscription_startup_retry_worker() {
         while true; do
             config_load "$NETSHIFT_CONFIG"
 
-            # Run in a child process: a successful subscription_update performs
-            # its own restart, which stops this worker via the pidfile safely.
-            # Keep diagnostics visible in syslog; subscription URLs are redacted
-            # in the lower-level download helpers.
-            if /usr/bin/netshift subscription_update; then
+            # Run in a child process: subscription_update applies the change
+            # itself, and when that takes a restart, the restart stops this
+            # worker via the pidfile safely. Keep diagnostics visible in syslog;
+            # subscription URLs are redacted in the lower-level download helpers.
+            /usr/bin/netshift subscription_update
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
                 log "Deferred subscription refresh succeeded; updated configuration is being applied" "info"
                 rm -f "$pidfile"
                 exit 0
             fi
 
-            log "Deferred subscription refresh has not completed yet; retrying in background" "warn"
-            sleep 30
+            # An unreachable feed is what this worker exists for: keep polling
+            # until it comes back. A feed that downloads but does not apply is a
+            # different story — every pass re-downloads the feeds and rebuilds the
+            # config, and a config sing-box keeps rejecting will not start
+            # passing because it is rebuilt every 30 seconds. So back off, and
+            # after a few failures in a row hand over to the scheduled
+            # subscription update: the pending-apply marker makes that one retry
+            # the apply too.
+            delay="$SUBSCRIPTION_RETRY_INTERVAL"
+            if [ "$rc" -eq "$SUBSCRIPTION_UPDATE_APPLY_FAILED" ]; then
+                apply_failures=$((apply_failures + 1))
+                if [ "$apply_failures" -ge "$SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES" ]; then
+                    log "Deferred subscription refresh downloaded the feeds but could not apply them $apply_failures times in a row; leaving it to the scheduled subscription update" "error"
+                    rm -f "$pidfile"
+                    exit 1
+                fi
+                delay=$((SUBSCRIPTION_RETRY_INTERVAL * (1 << (apply_failures - 1))))
+                [ "$delay" -gt "$SUBSCRIPTION_RETRY_BACKOFF_MAX" ] && delay="$SUBSCRIPTION_RETRY_BACKOFF_MAX"
+            fi
+
+            log "Deferred subscription refresh has not completed yet; retrying in ${delay}s" "warn"
+            sleep "$delay"
         done
     ) &
 
@@ -903,6 +926,11 @@ start_main() {
 
     # sing-box
     sing_box_init_config
+    # The config was just built from the current cache, so nothing is left over
+    # for subscription_update to re-apply. Only a build that succeeded gets
+    # here: a config sing-box rejects makes sing_box_init_config exit the
+    # process first, and the marker then stays for the next subscription_update.
+    rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
     config_foreach add_cron_job "section"
     config_foreach add_subscription_cron_job "section"
     /etc/init.d/sing-box start
@@ -1904,12 +1932,126 @@ list_update() {
     fi
 }
 
+# Reads a process's argv as one argument per line. Split out from
+# get_sing_box_daemon_pid so the test suite can supply a fake process table.
+# The stderr redirection comes first on purpose: the process may be gone by the
+# time /proc is read, and ash reports a failed `<` on whatever stderr is at that
+# point.
+read_proc_cmdline() {
+    tr '\0' '\n' 2>/dev/null <"/proc/$1/cmdline"
+}
+
+# The pid of the long-running sing-box daemon that runs config file $1, or
+# nothing.
+#
+# `pidof sing-box | awk '{print $1}'` is not good enough: NetShift itself spawns
+# short-lived sing-box processes (`rule-set decompile`, `tools fetch`, `check`),
+# pidof lists them in no defined order, and a signal sent to one of those is
+# simply lost when it exits — while the daemon keeps running the old config and
+# the caller reports success. The daemon is the process started with the `run`
+# subcommand, which the transient ones never carry; and it is NetShift's daemon
+# only if it was started on NetShift's config file (the sing-box init script
+# passes it as `-c <file>`), since another `sing-box run` on the router would
+# take the signal just as well and apply nothing. Arguments are matched whole,
+# not as substrings of the command line, so flags and paths cannot produce a
+# false positive.
+get_sing_box_daemon_pid() {
+    local config_path="$1"
+    local pid
+
+    for pid in $(pidof sing-box 2>/dev/null); do
+        if read_proc_cmdline "$pid" | awk -v config_path="$config_path" '
+            $0 == "run" { run = 1 }
+            previous == "-c" && $0 == config_path { own = 1 }
+            { previous = $0 }
+            END { exit !(run && own) }'; then
+            printf '%s' "$pid"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Applies a rebuilt sing-box config without restarting netshift. sing-box
+# reloads its config on SIGHUP inside the same process, so the nft rules, ip
+# rules and dnsmasq setup (none of which depend on subscription contents) stay
+# in place and only proxied connections are re-established. Falls back to a
+# full restart when sing-box is not running, cannot be signalled, runs off a
+# different config file, or does not survive the reload. A config that fails
+# validation is not applied: sing-box keeps the running one.
+reload_sing_box_config_in_place() {
+    local sing_box_pid config_path service_conffile hash_before hash_after settle
+
+    config_get config_path "settings" "config_path"
+
+    # A running daemon reads the file it was started with. sing_box_configure_service
+    # reconciles the sing-box service conffile with config_path, but it only runs
+    # from start_main — so if the two have drifted apart, the rebuild would write
+    # one file while SIGHUP makes sing-box re-read another, and this function
+    # would report success having applied nothing.
+    service_conffile="$(uci_get "sing-box" "main" "conffile")"
+    if [ "$service_conffile" != "$config_path" ]; then
+        echolog "ℹ️ The sing-box service uses a different config file ($service_conffile); restarting netshift"
+        restart
+        return $?
+    fi
+
+    sing_box_pid="$(get_sing_box_daemon_pid "$config_path")"
+    if [ -z "$sing_box_pid" ]; then
+        echolog "ℹ️ No running sing-box daemon found; restarting netshift"
+        restart
+        return $?
+    fi
+
+    hash_before="$(md5sum "$config_path" 2>/dev/null | awk '{print $1}')"
+
+    # sing_box_save_config exits the shell when sing-box rejects the config, so
+    # rebuild in a subshell to keep this process running. The running config
+    # survives either way: save_config validates the temporary file and only
+    # then moves it into place.
+    if ! (sing_box_init_config); then
+        echolog "❌ Failed to build a valid sing-box config; sing-box keeps the running config"
+        return 1
+    fi
+
+    hash_after="$(md5sum "$config_path" 2>/dev/null | awk '{print $1}')"
+    if [ "$hash_before" = "$hash_after" ]; then
+        echolog "ℹ️ sing-box config is unchanged; nothing to reload"
+        return 0
+    fi
+
+    if ! kill -HUP "$sing_box_pid" 2>/dev/null; then
+        echolog "⚠️ Failed to signal sing-box; restarting netshift"
+        restart
+        return $?
+    fi
+
+    # A delivered signal is not an applied config. sing-box re-reads the file in
+    # the same process, and a config that passed `check` can still fail to come
+    # back up (a port taken in the meantime, an interface that is gone) and take
+    # the process with it. The health monitor would then restart NetShift anyway
+    # — long after this function claimed the update had been applied without a
+    # restart. So wait for the reload to settle and require the same daemon.
+    settle="${SING_BOX_RELOAD_SETTLE_DELAY:-3}"
+    [ "$settle" -gt 0 ] && sleep "$settle"
+    if [ "$(get_sing_box_daemon_pid "$config_path")" != "$sing_box_pid" ]; then
+        echolog "⚠️ sing-box did not survive the config reload; restarting netshift"
+        restart
+        return $?
+    fi
+
+    echolog "🔄 sing-box reloaded the updated config without a netshift restart"
+}
+
 subscription_update() {
     echolog "🔄 Starting subscription update..."
 
     local has_subscription=0
     local updated_sections=0
     local failed_sections=0
+    local pending_apply=0
+    local apply_rc=0
 
     _check_subscription_section() {
         local section="$1"
@@ -2052,9 +2194,27 @@ subscription_update() {
 
         echolog "ℹ️ Subscription for section '$section' is unchanged"
     }
+    # download_subscription_into_cache stores a changed body in the cache and only
+    # then reports the change, so a change that was cached but never applied
+    # reads as "unchanged" on every later run: updated_sections stays 0, this
+    # function returns early, and the router keeps the old outbounds while the
+    # log says "no changes detected". The pending-apply marker breaks that
+    # standoff, and it has to be in place BEFORE the first feed is downloaded:
+    # the cache can be ahead of sing-box from that write on, and a run killed
+    # anywhere after it (OOM, kill, a crash while other sections are still
+    # downloading) must leave the marker behind. It is cleared only once nothing
+    # is left to apply. A marker left by an earlier run is read first; a stale
+    # one (a restart from elsewhere applied the cache already) costs one extra
+    # rebuild that finds an identical config.
+    pending_apply=0
+    [ -f "$SUBSCRIPTION_PENDING_APPLY_FLAG" ] && pending_apply=1
+    mkdir -p "$TMP_SING_BOX_FOLDER"
+    : > "$SUBSCRIPTION_PENDING_APPLY_FLAG"
+
     config_foreach _update_subscription_for_section "section"
 
-    if [ "$updated_sections" -eq 0 ]; then
+    if [ "$updated_sections" -eq 0 ] && [ "$pending_apply" -eq 0 ]; then
+        rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
         if [ "$failed_sections" -gt 0 ]; then
             echolog "❌ Subscription update finished with errors; keeping the last working cache"
             return 1
@@ -2064,13 +2224,20 @@ subscription_update() {
         return 0
     fi
 
-    echolog "🔄 Restarting netshift to apply updated subscriptions..."
-    restart
-    restart_rc=$?
-    if [ "$restart_rc" -ne 0 ]; then
-        echolog "❌ Subscription was downloaded, but netshift restart failed"
-        return "$restart_rc"
+    if [ "$updated_sections" -eq 0 ]; then
+        echolog "🔄 Applying a subscription change that was downloaded earlier but never reached sing-box..."
+    else
+        echolog "🔄 Applying updated subscriptions..."
     fi
+
+    # The marker stays until the apply succeeded.
+    reload_sing_box_config_in_place
+    apply_rc=$?
+    if [ "$apply_rc" -ne 0 ]; then
+        echolog "❌ Subscription was downloaded, but applying it failed (rc=$apply_rc); the next update will retry it"
+        return "$SUBSCRIPTION_UPDATE_APPLY_FAILED"
+    fi
+    rm -f "$SUBSCRIPTION_PENDING_APPLY_FLAG"
 
     if [ "$failed_sections" -gt 0 ]; then
         echolog "✅ Subscription update applied for changed sections; failed sections kept their previous cache"
@@ -2083,7 +2250,7 @@ subscription_update() {
 # Wipes ALL per-feed subscription cache files under SUBSCRIPTION_CACHE_FOLDER
 # (the four "${section}.<md5(url)>.{json,url,rejected,user_agent}" sidecars per
 # feed), then re-runs subscription_update verbatim so every feed is re-downloaded
-# fresh, re-validated, and the service restarts on change. Deleting the .json
+# fresh, re-validated, and applied on change. Deleting the .json
 # defeats the unchanged guard and deleting the .rejected defeats the rejected-hash
 # veto, so the redownload is a genuine full reset.
 #
@@ -3311,33 +3478,90 @@ configure_community_list_handler() {
     config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "rule_set" "$ruleset_tag")
 }
 
+# True when the rule tagged $2 in $1 ("route" or "dns") already references the
+# rule set $3. The route/DNS patches only ever extend a key, so a second call
+# for the same rule would add the same tag again.
+rule_references_ruleset() {
+    local scope="$1"
+    local rule_tag="$2"
+    local ruleset_tag="$3"
+
+    printf '%s' "$config" | jq -e \
+        --arg scope "$scope" \
+        --arg service_tag "$SERVICE_TAG" \
+        --arg rule "$rule_tag" \
+        --arg tag "$ruleset_tag" \
+        'any(.[$scope].rules[]?;
+            .[$service_tag] == $rule
+            and ((.rule_set // []) | if type == "array" then . else [.] end | index($tag) != null))' \
+        > /dev/null 2>&1
+}
+
 prepare_source_ruleset() {
     local section="$1"
     local name="$2"
     local type="$3"
     local route_rule_tag="$4"
 
+    case "$type" in
+    domains | subnets) ;;
+    *)
+        log "Unsupported remote rule set type: $type" "error"
+        return 1
+        ;;
+    esac
+
     log "Preparing a $name $type rule set for '$section' section" "debug"
     ruleset_tag=$(get_ruleset_tag "$section" "$name" "$type")
     ruleset_filepath="$TMP_RULESET_FOLDER/$ruleset_tag.json"
+
+    # Only a full restart wipes TMP_RULESET_FOLDER (stop_main), so a config
+    # rebuilt for a running sing-box finds the files of the previous build.
+    #
+    # What may be reused depends on where the content comes from. `user` and
+    # `local` rule sets are derived from UCI options and local list files and are
+    # refilled right after this call — but the patches only ever add (they merge
+    # with `unique`), so keeping the old file would keep entries the user has
+    # just deleted until the next full restart. Those are rebuilt from scratch.
+    # Plain remote lists are the exception: their content comes from downloads
+    # that a config rebuild does not repeat, so dropping the file would empty the
+    # rule set.
+    case "$name" in
+    user | local) rm -f "$ruleset_filepath" ;;
+    esac
+
+    # A rule set file that is not valid JSON (an interrupted write) would fail
+    # every later build until someone restarts NetShift. Recreate it instead.
+    if [ -f "$ruleset_filepath" ] && ! jq -e . "$ruleset_filepath" > /dev/null 2>&1; then
+        log "Source rule set $ruleset_filepath is not valid JSON, recreating it" "warn"
+        rm -f "$ruleset_filepath"
+    fi
+
     create_source_rule_set "$ruleset_filepath"
     case $? in
-    0)
-        config=$(sing_box_cm_add_local_ruleset "$config" "$ruleset_tag" "source" "$ruleset_filepath")
-        config=$(sing_box_cm_patch_route_rule "$config" "$route_rule_tag" "rule_set" "$ruleset_tag")
-        case "$type" in
-        domains)
-            config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "rule_set" "$ruleset_tag")
-            ;;
-        subnets) ;;
-        *)
-            log "Unsupported remote rule set type: $type" "error"
-            return 1
-            ;;
-        esac
-        ;;
-    3) log "Source rule set $ruleset_filepath already exists, skipping." "debug" ;;
+    0) ;;
+    3) log "Source rule set $ruleset_filepath already exists, reusing it." "debug" ;;
+    *) return 1 ;;
     esac
+
+    # Several lists of one section share a tag (plain remote lists), so the rule
+    # set is DEFINED once per build, and each reference is added once per rule.
+    # Both checks are narrow on purpose: whether the tag exists SOMEWHERE in the
+    # config says nothing about whether the rule this call is for points at it,
+    # and a rule left without a rule_set routes everything it matches direct.
+    if ! printf '%s' "$config" | jq -e --arg tag "$ruleset_tag" \
+        'any(.route.rule_set[]?; .tag == $tag)' > /dev/null 2>&1; then
+        config=$(sing_box_cm_add_local_ruleset "$config" "$ruleset_tag" "source" "$ruleset_filepath")
+    fi
+
+    if ! rule_references_ruleset "route" "$route_rule_tag" "$ruleset_tag"; then
+        config=$(sing_box_cm_patch_route_rule "$config" "$route_rule_tag" "rule_set" "$ruleset_tag")
+    fi
+
+    if [ "$type" = "domains" ] &&
+        ! rule_references_ruleset "dns" "$SB_FAKEIP_DNS_RULE_TAG" "$ruleset_tag"; then
+        config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "rule_set" "$ruleset_tag")
+    fi
 }
 
 configure_user_domain_list() {

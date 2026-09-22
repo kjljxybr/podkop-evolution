@@ -20,6 +20,28 @@ TMP_SUBSCRIPTION_DOWNLOAD_FOLDER="$TMP_SING_BOX_FOLDER/subscription-downloads"
 # tag-dedup + sing-box check bisection). Per-feed cache files are keyed
 # "${section}.<md5(url)>.<ext>" under SUBSCRIPTION_CACHE_FOLDER.
 TMP_SUBSCRIPTION_MERGE_FOLDER="$TMP_SING_BOX_FOLDER/subscription-merge"
+# Marks a subscription body that was downloaded into the cache but never made it
+# into the running sing-box. The cache compares a feed against what is already
+# stored, so without this marker the same body counts as "unchanged" on the next
+# run and the router keeps serving the old outbounds. Set before any feed is
+# downloaded. Lives in tmpfs on purpose: a reboot, and any start that builds a
+# valid config, applies the cache anyway.
+SUBSCRIPTION_PENDING_APPLY_FLAG="$TMP_SING_BOX_FOLDER/subscription-pending-apply"
+# Seconds to wait after SIGHUP before deciding that sing-box came back up on the
+# new config. Tests set it to 0.
+SING_BOX_RELOAD_SETTLE_DELAY="3"
+# Exit code of `netshift subscription_update` when the feeds were downloaded but
+# applying them failed (the pending-apply marker stays for the next run).
+SUBSCRIPTION_UPDATE_APPLY_FAILED=3
+# Deferred startup subscription refresh (start_subscription_startup_retry_worker):
+# a feed that is unreachable is retried every SUBSCRIPTION_RETRY_INTERVAL
+# seconds for as long as it takes. A feed that downloads but does not apply is
+# retried with the wait doubling up to SUBSCRIPTION_RETRY_BACKOFF_MAX, and after
+# SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES such failures in a row the worker leaves
+# it to the scheduled subscription update.
+SUBSCRIPTION_RETRY_INTERVAL=30
+SUBSCRIPTION_RETRY_MAX_APPLY_FAILURES=5
+SUBSCRIPTION_RETRY_BACKOFF_MAX=600
 # Subscription User-Agent fallback. Many panels return a DIFFERENT body format
 # depending on the client User-Agent (sing-box JSON vs base64 URI list vs Clash
 # vs Xray JSON, or an HTML/403 stub for unknown clients). When no User-Agent is
