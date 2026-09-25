@@ -2682,6 +2682,92 @@ sing_box_build_subscription_groups() {
     ' 2>/dev/null
 }
 
+# Display name of one subscription feed, used for its own urltest group: the
+# URL fragment ("https://host/sub#My%20VPN" -> "My VPN") when there is one,
+# else the host. The fragment is never sent to the server (uclient-fetch, GNU
+# wget and curl all drop it). $2 is used when neither yields a name.
+get_subscription_feed_display_name() {
+    local url="$1"
+    local fallback="$2"
+    local name=""
+
+    case "$url" in
+    *'#'*)
+        name="$(url_decode_component "${url#*#}" | tr -d '\000-\037\177')"
+        ;;
+    esac
+
+    if [ -z "$name" ]; then
+        case "$url" in
+        *://*)
+            name="${url#*://}"
+            name="${name%%[/?#]*}"
+            name="${name##*@}"
+            case "$name" in
+            \[*\]*)
+                name="${name#\[}"
+                name="${name%%\]*}"
+                ;;
+            *)
+                name="${name%%:*}"
+                ;;
+            esac
+            ;;
+        esac
+    fi
+
+    [ -n "$name" ] || name="$fallback"
+    printf '%s' "$name"
+}
+
+# Appends the proxy outbounds of one cached feed onto the merged subscription
+# file, stamping each with $SUBSCRIPTION_FEED_MARKER_KEY = <feed index> so the
+# nodes can be split back per feed after the facade has filtered/deduped them.
+# Returns non-zero (merged file untouched) when the feed cannot be merged.
+subscription_merge_feed_outbounds() {
+    local merged_json_path="$1"
+    local feed_json_path="$2"
+    local feed_index="$3"
+    local merged_tmp="${merged_json_path}.tmp.$$"
+
+    # No Oniguruma: pure array concat with --slurpfile.
+    if jq -c --slurpfile feed "$feed_json_path" \
+        --arg feed_key "$SUBSCRIPTION_FEED_MARKER_KEY" \
+        --argjson feed_index "$feed_index" '
+        .outbounds += [ $feed[0].outbounds[]? | select(
+            .type != "selector" and .type != "urltest" and
+            .type != "direct" and .type != "dns" and .type != "block"
+        ) | .[$feed_key] = $feed_index ]
+    ' "$merged_json_path" > "$merged_tmp" 2>/dev/null && [ -s "$merged_tmp" ]; then
+        mv "$merged_tmp" "$merged_json_path"
+        return 0
+    fi
+
+    rm -f "$merged_tmp"
+    return 1
+}
+
+# Splits the kept subscription tags back per feed. $1 = tags (JSON array),
+# $2 = feed index per tag (parallel JSON array, null = unknown), $3 = feed
+# display names indexed by feed. Prints [{name, tags}] for every feed that kept
+# at least one node, in feed order; tags without a feed index are left out.
+sing_box_build_subscription_feed_groups() {
+    local tags_json="$1"
+    local feeds_json="$2"
+    local names_json="$3"
+
+    jq -cn --argjson tags "$tags_json" --argjson feeds "$feeds_json" --argjson names "$names_json" '
+        [range(0; $tags | length) as $i | {tag: $tags[$i], feed: $feeds[$i]}
+            | select(.feed | type == "number")] as $pairs
+        | [($pairs | map(.feed) | unique)[] as $f
+            | {
+                name: (($names[$f] // "") | tostring
+                    | if length > 0 then . else "Subscription \($f + 1)" end),
+                tags: [$pairs[] | select(.feed == $f) | .tag]
+              }]
+    ' 2>/dev/null
+}
+
 is_truthy_option() {
     local value="$1"
 
@@ -2909,7 +2995,8 @@ configure_outbound_handler() {
                 subscription_filter_include_keywords_json subscription_filter_exclude_keywords_json \
                 subscription_keyword_filter_active urlhash subscription_json_path subscription_url_cache_path \
                 cached_subscription_url should_download had_usable_cache merged_json_path merged_node_count \
-                usable_feed_count feed_node_count merged_tmp
+                usable_feed_count feed_node_count feed_index subscription_feed_names_json \
+                subscription_outbound_feeds_json
 
             config_get urltest_check_interval "$section" "urltest_check_interval" "3m"
             config_get urltest_tolerance "$section" "urltest_tolerance" 50
@@ -3062,8 +3149,17 @@ configure_outbound_handler() {
             }
             printf '%s' '{"outbounds":[]}' > "$merged_json_path"
             usable_feed_count=0
+            # Feed index = position in the subscription_url list (dead feeds
+            # included), so names stay aligned with the stamped nodes.
+            feed_index=0
+            subscription_feed_names_json="[]"
             while IFS= read -r subscription_url || [ -n "$subscription_url" ]; do
                 [ -n "$subscription_url" ] || continue
+                feed_index=$((feed_index + 1))
+                subscription_feed_names_json="$(jq -cn --argjson names "$subscription_feed_names_json" \
+                    --arg name "$(get_subscription_feed_display_name "$subscription_url" "Subscription $feed_index")" \
+                    '$names + [$name]' 2>/dev/null)"
+                [ -n "$subscription_feed_names_json" ] || subscription_feed_names_json="[]"
                 urlhash="$(get_subscription_url_hash "$subscription_url")"
                 subscription_json_path="$(get_subscription_json_path "$section" "$urlhash")"
                 subscription_cache_is_usable "$subscription_json_path" || {
@@ -3077,20 +3173,12 @@ configure_outbound_handler() {
                 )] | length' "$subscription_json_path" 2>/dev/null)"
                 [ -n "$feed_node_count" ] || feed_node_count=0
 
-                # Append this feed's proxy outbounds onto the merged set. No
-                # Oniguruma: pure array concat with --slurpfile.
-                merged_tmp="${merged_json_path}.tmp.$$"
-                if jq -c --slurpfile feed "$subscription_json_path" '
-                    .outbounds += [ $feed[0].outbounds[]? | select(
-                        .type != "selector" and .type != "urltest" and
-                        .type != "direct" and .type != "dns" and .type != "block"
-                    ) ]
-                ' "$merged_json_path" > "$merged_tmp" 2>/dev/null && [ -s "$merged_tmp" ]; then
-                    mv "$merged_tmp" "$merged_json_path"
+                # Append this feed's proxy outbounds onto the merged set, each
+                # stamped with its 0-based feed index.
+                if subscription_merge_feed_outbounds "$merged_json_path" "$subscription_json_path" "$((feed_index - 1))"; then
                     usable_feed_count=$((usable_feed_count + 1))
                     log "Subscription feed for section '$section' contributed $feed_node_count node(s) (url=$(redact_url_for_log "$subscription_url"))" "info"
                 else
-                    rm -f "$merged_tmp"
                     log "Failed to merge subscription feed for section '$section' (url=$(redact_url_for_log "$subscription_url"))" "warn"
                 fi
             done < "$subscription_urls_tmp"
@@ -3127,6 +3215,7 @@ configure_outbound_handler() {
                 if [ -z "$subscription_outbound_tags_json" ] || [ "$subscription_outbound_tags_json" = "[]" ]; then
                     subscription_outbound_tags_json="$(comma_string_to_json_array "$SUBSCRIPTION_OUTBOUND_TAGS")"
                 fi
+                subscription_outbound_feeds_json="$SUBSCRIPTION_OUTBOUND_FEEDS_JSON"
 
                 if [ "$group_mode" != "off" ]; then
                     local grouping_json group_key group_outbounds group_tag group_keys_tmp \
@@ -3238,11 +3327,41 @@ configure_outbound_handler() {
                     config="$(sing_box_cm_add_selector_outbound "$config" "$selector_tag" "$selector_outbounds" "$selector_default" "true")"
                 else
                     # Create urltest + selector (default subscription behaviour)
+                    local feed_groups_json feed_groups_count feed_group_index feed_group_name feed_group_tags \
+                        feed_urltest_tag feed_urltest_tags_json
                     urltest_tag="$(get_outbound_tag_by_section "$section-urltest")"
                     urltest_outbounds="$subscription_outbound_tags_json"
+
+                    # Two or more feeds with nodes: every feed also gets its own
+                    # urltest ("⚡ <feed name>") so the dashboard can offer a
+                    # Fastest per subscription. The section-wide urltest over
+                    # all nodes stays the selector default.
+                    feed_urltest_tags_json="[]"
+                    feed_groups_json="$(sing_box_build_subscription_feed_groups "$subscription_outbound_tags_json" \
+                        "${subscription_outbound_feeds_json:-[]}" "${subscription_feed_names_json:-[]}")"
+                    feed_groups_count="$(printf '%s' "$feed_groups_json" | jq -r 'length' 2>/dev/null)"
+                    case "$feed_groups_count" in
+                    '' | *[!0-9]*) feed_groups_count=0 ;;
+                    esac
+                    if [ "$feed_groups_count" -ge 2 ]; then
+                        feed_group_index=0
+                        while [ "$feed_group_index" -lt "$feed_groups_count" ]; do
+                            feed_group_name="$(printf '%s' "$feed_groups_json" | jq -r --argjson i "$feed_group_index" '.[$i].name')"
+                            feed_group_tags="$(printf '%s' "$feed_groups_json" | jq -c --argjson i "$feed_group_index" '.[$i].tags')"
+                            feed_urltest_tag="$(sing_box_get_unique_outbound_tag "$config" \
+                                "${SB_SUBSCRIPTION_FEED_GROUP_TAG_PREFIX}${feed_group_name}")"
+                            config="$(sing_box_cm_add_urltest_outbound "$config" "$feed_urltest_tag" "$feed_group_tags" \
+                                "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance")"
+                            feed_urltest_tags_json="$(printf '%s' "$feed_urltest_tags_json" | jq -ac --arg tag "$feed_urltest_tag" '. + [$tag]')"
+                            feed_group_index=$((feed_group_index + 1))
+                        done
+                        log "Subscription section '$section': $feed_groups_count per-subscription urltest group(s)" "debug"
+                    fi
+
                     selector_outbounds=$(
-                        jq -acn --argjson outbounds "$subscription_outbound_tags_json" --arg tag "$urltest_tag" \
-                            '$outbounds + [$tag]' 2>/dev/null
+                        jq -acn --argjson outbounds "$subscription_outbound_tags_json" \
+                            --argjson feeds "$feed_urltest_tags_json" --arg tag "$urltest_tag" \
+                            '$outbounds + $feeds + [$tag]' 2>/dev/null
                     )
                     if [ -z "$selector_outbounds" ]; then
                         log "Failed to build selector outbounds for subscription section '$section'. Aborted." "fatal"

@@ -4906,6 +4906,265 @@ FGEOF
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Test: per-subscription urltest groups (several subscription_url in one section)
+#
+# A subscription section with two or more feeds gets, next to the section-wide
+# "<section>-urltest-out", one urltest per feed ("⚡ <feed name>") so the
+# dashboard can show every subscription in its own block with its own Fastest.
+# Covers the shipped pieces end to end: the feed display name, the merge that
+# stamps every node with its feed index, the REAL facade carrying that index
+# through keyword filter / tag dedup / sing-box check bisection, the feed
+# grouper, and the flat (group_mode=off) branch extracted verbatim from the bin.
+# Synthetic hosts/tags only. Tokens use the name:OK/FAIL convention.
+# ─────────────────────────────────────────────────────────────────
+test_feed_groups() {
+    header "Per-Subscription urltest Groups"
+
+    if ! command -v jq > /dev/null 2>&1; then
+        skip "jq not available"
+        return
+    fi
+
+    local bin="${NETSHIFT_SRC}/usr/bin/netshift"
+    local lib="$NETSHIFT_LIB_DIR"
+    if [ ! -r "$bin" ] || [ ! -r "$lib/sing_box_config_facade.sh" ]; then
+        skip "netshift bin / facade not found"
+        return
+    fi
+
+    local work="/tmp/netshift-feedgroups-$$"
+    mkdir -p "$work"
+    local drv="$work/driver.sh"
+
+    cat > "$drv" << 'FDEOF'
+mkdir -p /usr/lib/netshift
+for f in constants.sh helpers.sh logging.sh sing_box_config_manager.sh sing_box_config_facade.sh; do
+    ln -sf "LIB_DIR/$f" "/usr/lib/netshift/$f"
+done
+. /usr/lib/netshift/constants.sh
+. /usr/lib/netshift/logging.sh
+. /usr/lib/netshift/sing_box_config_facade.sh
+log() { :; }
+echolog() { :; }
+nolog() { :; }
+is_sing_box_extended() { return 0; }
+
+for fn in sing_box_get_unique_outbound_tag sing_box_build_subscription_feed_groups \
+          get_subscription_feed_display_name subscription_merge_feed_outbounds; do
+    eval "$(awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
+done
+get_outbound_tag_by_section() { printf '%s-out' "$1"; }
+
+_off_branch() {
+EXTRACT_OFF
+}
+
+# $1 = tags json, $2 = feeds json ("" = unset), $3 = names json, $4 = config
+run_off() {
+    section="syn"
+    selector_tag="syn-out"
+    subscription_outbound_tags_json="$1"
+    subscription_outbound_feeds_json="$2"
+    subscription_feed_names_json="$3"
+    config="$4"
+    urltest_testing_url="https://www.gstatic.com/generate_204"
+    urltest_check_interval="3m"
+    urltest_tolerance="50"
+    selector_outbounds=""
+    _off_branch
+    printf '%s' "$config"
+}
+
+ok() { echo "$1:OK"; }
+bad() { echo "$1:FAIL $2"; }
+expect_eq() {
+    if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "(got '$2', want '$3')"; fi
+}
+
+# ── Feed display name ─────────────────────────────────────────────
+expect_eq fg-name-fragment "$(get_subscription_feed_display_name 'https://sub.example.com/api/TOKEN#My%20VPN' x)" "My VPN"
+expect_eq fg-name-fragment-utf8 "$(get_subscription_feed_display_name 'https://sub.example.com/x#%D0%A0%D0%A4' x)" "РФ"
+expect_eq fg-name-fragment-ctrl "$(get_subscription_feed_display_name 'https://sub.example.com/x#A%0AB%09C' x)" "ABC"
+expect_eq fg-name-host "$(get_subscription_feed_display_name 'https://sub.example.com/api/TOKEN?x=1' x)" "sub.example.com"
+expect_eq fg-name-empty-fragment "$(get_subscription_feed_display_name 'https://sub.example.com/p#' x)" "sub.example.com"
+expect_eq fg-name-userinfo-port "$(get_subscription_feed_display_name 'https://u:p@sub.example.com:8443/p' x)" "sub.example.com"
+expect_eq fg-name-at-in-path "$(get_subscription_feed_display_name 'https://sub.example.com/a@b/c' x)" "sub.example.com"
+expect_eq fg-name-ipv6 "$(get_subscription_feed_display_name 'https://[2001:db8::1]:8443/p' x)" "2001:db8::1"
+expect_eq fg-name-fallback "$(get_subscription_feed_display_name 'not a url/' 'Subscription 2')" "Subscription 2"
+
+# ── Merge stamps the feed index ───────────────────────────────────
+feed_a="/tmp/fg-feed-a-$$.json"
+feed_b="/tmp/fg-feed-b-$$.json"
+feed_bad="/tmp/fg-feed-bad-$$.json"
+merged="/tmp/fg-merged-$$.json"
+printf '%s' '{"outbounds":[
+  {"type":"shadowsocks","tag":"A-1","server":"10.1.0.1","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"shadowsocks","tag":"Same","server":"10.1.0.2","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"shadowsocks","tag":"A-drop","server":"10.1.0.3","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"selector","tag":"sel","outbounds":["A-1"]},
+  {"type":"direct","tag":"direct"}
+]}' > "$feed_a"
+printf '%s' '{"outbounds":[
+  {"type":"shadowsocks","tag":"Same","server":"10.2.0.1","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"shadowsocks","tag":"B-2","server":"10.2.0.2","server_port":443,"method":"aes-256-gcm","password":"p"}
+]}' > "$feed_b"
+printf '%s' 'not json' > "$feed_bad"
+printf '%s' '{"outbounds":[]}' > "$merged"
+
+subscription_merge_feed_outbounds "$merged" "$feed_a" 0 && ok fg-merge-a-rc || bad fg-merge-a-rc
+if subscription_merge_feed_outbounds "$merged" "$feed_bad" 1; then bad fg-merge-bad-rc; else ok fg-merge-bad-rc; fi
+subscription_merge_feed_outbounds "$merged" "$feed_b" 2 && ok fg-merge-b-rc || bad fg-merge-b-rc
+expect_eq fg-merge-feeds "$(jq -c --arg k "$SUBSCRIPTION_FEED_MARKER_KEY" '[.outbounds[] | .[$k]]' "$merged")" "[0,0,0,2,2]"
+expect_eq fg-merge-proxies-only "$(jq -c '[.outbounds[].type] | unique' "$merged")" '["shadowsocks"]'
+
+# ── Facade carries the feed index through filter / dedup / check ──
+base_config='{"outbounds":[{"type":"direct","tag":"direct-out"}]}'
+sing_box_cf_add_subscription_outbounds "$base_config" "syn" "$merged" '[]' '["drop"]' > /dev/null
+out_cfg="$SING_BOX_CF_LAST_CONFIG"
+expect_eq fg-facade-tags "$SUBSCRIPTION_OUTBOUND_TAGS_JSON" '["A-1","Same","Same-1","B-2"]'
+expect_eq fg-facade-feeds "$SUBSCRIPTION_OUTBOUND_FEEDS_JSON" '[0,0,2,2]'
+expect_eq fg-facade-marker-stripped \
+    "$(printf '%s' "$out_cfg" | jq -r --arg k "$SUBSCRIPTION_FEED_MARKER_KEY" '[.outbounds[] | select(has($k))] | length')" "0"
+
+# Unmarked input (no marker key) keeps working; feeds are all null.
+unmarked="/tmp/fg-unmarked-$$.json"
+cp "$feed_b" "$unmarked"
+sing_box_cf_add_subscription_outbounds "$base_config" "syn" "$unmarked" '[]' '[]' > /dev/null
+expect_eq fg-facade-unmarked-feeds "$SUBSCRIPTION_OUTBOUND_FEEDS_JSON" '[null,null]'
+
+# ── Feed grouper ──────────────────────────────────────────────────
+expect_eq fg-groups-two \
+    "$(sing_box_build_subscription_feed_groups '["a","b","c","d"]' '[0,2,0,2]' '["Feed A","dead","Feed C"]')" \
+    '[{"name":"Feed A","tags":["a","c"]},{"name":"Feed C","tags":["b","d"]}]'
+expect_eq fg-groups-null-feeds \
+    "$(sing_box_build_subscription_feed_groups '["a","b"]' '[null,null]' '[]')" '[]'
+expect_eq fg-groups-short-feeds \
+    "$(sing_box_build_subscription_feed_groups '["a","b"]' '[0]' '["A"]')" '[{"name":"A","tags":["a"]}]'
+expect_eq fg-groups-missing-name \
+    "$(sing_box_build_subscription_feed_groups '["a"]' '[1]' '["A"]')" '[{"name":"Subscription 2","tags":["a"]}]'
+
+# ── Flat (off) branch ─────────────────────────────────────────────
+nodes='{"outbounds":[
+  {"type":"direct","tag":"direct-out"},
+  {"type":"shadowsocks","tag":"a1","server":"10.3.0.1","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"shadowsocks","tag":"a2","server":"10.3.0.2","server_port":443,"method":"aes-256-gcm","password":"p"},
+  {"type":"shadowsocks","tag":"b1","server":"10.3.0.3","server_port":443,"method":"aes-256-gcm","password":"p"}
+]}'
+tags='["a1","a2","b1"]'
+P="$SB_SUBSCRIPTION_FEED_GROUP_TAG_PREFIX"
+
+two="$(run_off "$tags" '[0,0,1]' '["Feed A","Feed B"]' "$nodes")"
+if printf '%s' "$two" | jq -e --arg a "${P}Feed A" --arg b "${P}Feed B" '
+    ([.outbounds[] | select(.type == "urltest")] | map({(.tag): .outbounds}) | add)
+      == {($a): ["a1","a2"], ($b): ["b1"], "syn-urltest-out": ["a1","a2","b1"]}
+' > /dev/null 2>&1; then
+    ok fg-off-two-feed-urltests
+else
+    bad fg-off-two-feed-urltests "$(printf '%s' "$two" | jq -c '[.outbounds[]|select(.type=="urltest")|{tag,outbounds}]')"
+fi
+if printf '%s' "$two" | jq -e --arg a "${P}Feed A" --arg b "${P}Feed B" '
+    [.outbounds[] | select(.type == "selector" and .tag == "syn-out")] as $s
+    | ($s | length) == 1
+    and $s[0].default == "syn-urltest-out"
+    and $s[0].outbounds == ["a1","a2","b1",$a,$b,"syn-urltest-out"]
+' > /dev/null 2>&1; then
+    ok fg-off-two-selector
+else
+    bad fg-off-two-selector "$(printf '%s' "$two" | jq -c '.outbounds[]|select(.type=="selector")|{default,outbounds}')"
+fi
+if command -v sing-box > /dev/null 2>&1; then
+    printf '%s' "$two" | jq '{
+        log: {disabled: true},
+        dns: {servers: [], rules: [], final: "direct"},
+        inbounds: [{type: "direct", tag: "dns-in", listen: "127.0.0.42", listen_port: 53}],
+        outbounds: .outbounds,
+        route: {rules: [], rule_set: [], final: "direct-out", auto_detect_interface: true}
+    }' > /tmp/fg-check-$$.json
+    if sing-box -c /tmp/fg-check-$$.json check > /dev/null 2>&1; then
+        ok fg-off-two-singbox-check
+    else
+        bad fg-off-two-singbox-check "$(sing-box -c /tmp/fg-check-$$.json check 2>&1 | head -2)"
+    fi
+    rm -f /tmp/fg-check-$$.json
+else
+    echo 'fg-off-two-singbox-check:SKIP'
+fi
+
+# One feed with nodes (the other one is dead): exactly the old shape.
+one="$(run_off "$tags" '[1,1,1]' '["dead","Feed B"]' "$nodes")"
+if printf '%s' "$one" | jq -e '
+    ([.outbounds[] | select(.type == "urltest")] | map(.tag)) == ["syn-urltest-out"]
+    and ([.outbounds[] | select(.type == "selector")][0].outbounds == ["a1","a2","b1","syn-urltest-out"])
+' > /dev/null 2>&1; then
+    ok fg-off-single-feed-unchanged
+else
+    bad fg-off-single-feed-unchanged "$(printf '%s' "$one" | jq -c '[.outbounds[]|select(.type=="urltest" or .type=="selector")|{tag,outbounds}]')"
+fi
+
+# No feed info at all (e.g. a caller that never set it): old shape.
+none="$(run_off "$tags" '' '' "$nodes")"
+if printf '%s' "$none" | jq -e '
+    ([.outbounds[] | select(.type == "urltest")] | map(.tag)) == ["syn-urltest-out"]
+    and ([.outbounds[] | select(.type == "selector")][0].default == "syn-urltest-out")
+' > /dev/null 2>&1; then
+    ok fg-off-no-feed-info-unchanged
+else
+    bad fg-off-no-feed-info-unchanged "$(printf '%s' "$none" | jq -c '[.outbounds[]|select(.type=="urltest" or .type=="selector")|{tag,outbounds}]')"
+fi
+
+# Two feeds with the same display name get distinct urltest tags.
+dup="$(run_off "$tags" '[0,0,1]' '["same.example.com","same.example.com"]' "$nodes")"
+expect_eq fg-off-duplicate-names-unique \
+    "$(printf '%s' "$dup" | jq -c '[.outbounds[] | select(.type == "urltest") | .tag] | length as $n | (unique | length) == $n and $n == 3')" "true"
+
+rm -f "$feed_a" "$feed_b" "$feed_bad" "$merged" "$unmarked"
+echo 'DONE'
+FDEOF
+
+    # Splice the flat-branch body (from its marker comment through the final
+    # selector add, which is the last statement of that else) into the driver.
+    local region="$work/region.sh"
+    awk '
+        /# Create urltest \+ selector \(default subscription behaviour\)/{p=1}
+        p{print}
+        p && /"\$selector_tag" "\$selector_outbounds" "\$urltest_tag" "true"\)"/{exit}
+    ' "$bin" > "$region"
+    if grep -q 'sing_box_build_subscription_feed_groups' "$region" \
+        && grep -q 'sing_box_cm_add_selector_outbound' "$region"; then
+        pass "fg-region-extracted:OK"
+    else
+        fail "fg-region-extracted:FAIL" "$(head -3 "$region" 2>/dev/null)"
+    fi
+    {
+        sed '/EXTRACT_OFF/q' "$drv" | sed '$d'
+        cat "$region"
+        sed -n '/EXTRACT_OFF/,$p' "$drv" | sed '1d'
+    } > "$drv.spliced"
+    mv "$drv.spliced" "$drv"
+    sed -i "s|LIB_DIR|$lib|g; s|BIN_PATH|$bin|g" "$drv"
+
+    local out="$work/out.log"
+    ash "$drv" > "$out" 2>/dev/null || true
+    local saw_done=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            *:OK) pass "$line" ;;
+            *:FAIL*) fail "$line" ;;
+            *:SKIP) skip "$line" ;;
+            DONE) saw_done=1 ;;
+            *) ;;
+        esac
+    done < "$out"
+    if [ "$saw_done" = "1" ]; then
+        pass "fg-driver-completed:OK"
+    else
+        fail "fg-driver-completed:FAIL (driver aborted early)" "$(tail -3 "$out" 2>/dev/null)"
+    fi
+
+    rm -rf "$work"
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Test: Insecure subscription fetch flag (task-021b)
 #
 # Exercises download_subscription's 8th positional arg (insecure 0|1). A
@@ -10807,6 +11066,7 @@ main() {
             test_diagnostics
             test_subscription
             test_fastest_group
+            test_feed_groups
             test_insecure_fetch
             test_rejected_hash
             test_jobstate
@@ -10845,6 +11105,7 @@ main() {
         diagnostics) test_diagnostics ;;
         subscription) test_subscription ;;
         fastest)     test_fastest_group ;;
+        feedgroups)  test_feed_groups ;;
         insecure)    test_insecure_fetch ;;
         rejected)    test_rejected_hash ;;
         jobstate)    test_jobstate ;;
@@ -10872,7 +11133,7 @@ main() {
         proxylink)   test_proxy_link_escaping ;;
         *)
             echo "Unknown test: $target"
-            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest insecure rejected jobstate selfheal dnsdetour ecssubnet suburlopt subcron globalproxy bittorrent stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload cachepersist"
+            echo "Available: all deps syntax config helpers jq cm sb nft nftv6 selmark isolation monfd unsupported textlist chunkcheck domsep domcase proxylink diagnostics subscription fastest feedgroups insecure rejected jobstate selfheal dnsdetour ecssubnet suburlopt subcron globalproxy bittorrent stablecheck extcheck sbextarch netshiftcheck latesttag ghredirect selfupdate backupguard hotreload cachepersist"
             exit 1
             ;;
     esac

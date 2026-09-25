@@ -571,6 +571,7 @@ sing_box_cf_prepare_subscription_batch() {
     # the subscription JSON is slurped from its file path.
     printf '%s' "$config" | jq -c \
         --slurpfile sub "$subscription_json_path" \
+        --arg feed_key "$SUBSCRIPTION_FEED_MARKER_KEY" \
         --argjson extended "$sing_box_extended" \
         --argjson include_keywords "$include_keywords_json" \
         --argjson exclude_keywords "$exclude_keywords_json" '
@@ -655,13 +656,17 @@ sing_box_cf_prepare_subscription_batch() {
             | .out += [{
                 tag: $tag,
                 name: (if ($entry.name | length) > 0 then $entry.name else $tag end),
-                outbound: ($ob | del(.tag) | del(.remark) | . + {tag: $tag})
+                # Feed index stamped by the multi-URL merge (null otherwise);
+                # the marker itself must never reach sing-box.
+                feed: ($ob[$feed_key] // null),
+                outbound: ($ob | del(.tag) | del(.remark) | del(.[$feed_key]) | . + {tag: $tag})
               }]
           ) as $resolved
         | {
             outbounds: [$resolved.out[].outbound],
             tags: [$resolved.out[].tag],
             names: [$resolved.out[].name],
+            feeds: [$resolved.out[].feed],
             count: ($resolved.out | length),
             skipped: ($total - ($resolved.out | length))
           }
@@ -781,6 +786,8 @@ sing_box_cf_apply_subscription_range() {
 #   Writes updated JSON configuration to stdout
 #   Sets global variable SUBSCRIPTION_OUTBOUND_TAGS (comma-separated list of tags)
 #   Sets global variable SUBSCRIPTION_OUTBOUND_TAGS_JSON (JSON array of tags, ASCII-escaped)
+#   Sets global variable SUBSCRIPTION_OUTBOUND_FEEDS_JSON (JSON array parallel to the tags:
+#       the feed index each node was stamped with by the multi-URL merge, or null)
 #   Sets global variable SUBSCRIPTION_OUTBOUND_NAMES (newline-separated list of display names)
 #######################################
 sing_box_cf_add_subscription_outbounds() {
@@ -795,6 +802,7 @@ sing_box_cf_add_subscription_outbounds() {
 
     SUBSCRIPTION_OUTBOUND_TAGS=""
     SUBSCRIPTION_OUTBOUND_TAGS_JSON="[]"
+    SUBSCRIPTION_OUTBOUND_FEEDS_JSON="[]"
     SUBSCRIPTION_OUTBOUND_NAMES=""
     SING_BOX_CF_LAST_CONFIG="$config"
 
@@ -898,6 +906,12 @@ sing_box_cf_add_subscription_outbounds() {
             '[.tags as $t | $ranges[] | range(.start; .start + .count) | $t[.]]' 2>/dev/null
     )
     [ -n "$SUBSCRIPTION_OUTBOUND_TAGS_JSON" ] || SUBSCRIPTION_OUTBOUND_TAGS_JSON="[]"
+
+    SUBSCRIPTION_OUTBOUND_FEEDS_JSON=$(
+        printf '%s' "$prepared" | jq -c --argjson ranges "$kept_ranges_json" \
+            '[.feeds as $f | $ranges[] | range(.start; .start + .count) | $f[.]]' 2>/dev/null
+    )
+    [ -n "$SUBSCRIPTION_OUTBOUND_FEEDS_JSON" ] || SUBSCRIPTION_OUTBOUND_FEEDS_JSON="[]"
 
     SUBSCRIPTION_OUTBOUND_TAGS=$(
         printf '%s' "$SUBSCRIPTION_OUTBOUND_TAGS_JSON" | jq -r 'join(",")' 2>/dev/null
