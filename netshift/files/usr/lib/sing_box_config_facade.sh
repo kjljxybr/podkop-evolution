@@ -551,6 +551,7 @@ sing_box_cf_add_single_key_reject_rule() {
 # Outputs:
 #   Writes a JSON object to stdout:
 #     { outbounds: [ {type,...,tag} ... ], tags: [..], names: [..],
+#       feeds: [..] (feed index per tag from $SUBSCRIPTION_FEED_MARKER_KEY, or null),
 #       count: <kept>, skipped: <statically dropped> }
 #######################################
 sing_box_cf_prepare_subscription_batch() {

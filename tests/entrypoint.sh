@@ -4950,7 +4950,8 @@ nolog() { :; }
 is_sing_box_extended() { return 0; }
 
 for fn in sing_box_get_unique_outbound_tag sing_box_build_subscription_feed_groups \
-          get_subscription_feed_display_name subscription_merge_feed_outbounds; do
+          get_subscription_feed_display_name subscription_merge_feed_outbounds \
+          get_subscription_url_hash; do
     eval "$(awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
 done
 get_outbound_tag_by_section() { printf '%s-out' "$1"; }
@@ -4991,6 +4992,58 @@ expect_eq fg-name-userinfo-port "$(get_subscription_feed_display_name 'https://u
 expect_eq fg-name-at-in-path "$(get_subscription_feed_display_name 'https://sub.example.com/a@b/c' x)" "sub.example.com"
 expect_eq fg-name-ipv6 "$(get_subscription_feed_display_name 'https://[2001:db8::1]:8443/p' x)" "2001:db8::1"
 expect_eq fg-name-fallback "$(get_subscription_feed_display_name 'not a url/' 'Subscription 2')" "Subscription 2"
+expect_eq fg-name-fragment-trim "$(get_subscription_feed_display_name 'https://sub.example.com/x#%20%20My%20VPN%20' x)" "My VPN"
+expect_eq fg-name-fragment-blank "$(get_subscription_feed_display_name 'https://sub.example.com/x#%20%09' x)" "sub.example.com"
+
+# ── The fragment is only a name: not hashed, never fetched ────────
+expect_eq fg-hash-ignores-fragment \
+    "$(get_subscription_url_hash 'https://sub.example.com/api/TOKEN#My%20VPN')" \
+    "$(get_subscription_url_hash 'https://sub.example.com/api/TOKEN')"
+if [ "$(get_subscription_url_hash 'https://sub.example.com/api/A')" != "$(get_subscription_url_hash 'https://sub.example.com/api/B')" ]; then
+    ok fg-hash-distinct-urls
+else
+    bad fg-hash-distinct-urls
+fi
+
+# Fake wget: logs its URL (last argument), writes a body to its -O target.
+fg_bin="/tmp/fg-bin-$$"
+mkdir -p "$fg_bin"
+cat > "$fg_bin/wget" << 'FGWEOF'
+#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+    [ "$prev" = "-O" ] && out="$a"
+    prev="$a"
+    last="$a"
+done
+printf '%s\n' "$last" >> "$FG_WGET_LOG"
+[ -n "$out" ] && [ "$out" != /dev/null ] && printf 'body' > "$out"
+exit 0
+FGWEOF
+chmod 0755 "$fg_bin/wget"
+FG_WGET_LOG="/tmp/fg-wget-$$.log"
+export FG_WGET_LOG
+get_sing_box_version() { echo "1.12.0"; }
+get_device_model() { echo "test-model"; }
+get_kernel_version() { echo "test-kernel"; }
+generate_hwid() { echo "test-hwid"; }
+should_force_wget_ipv4() { return 1; }
+has_ipv4_default_route() { return 1; }
+wget_supports_ipv4_flag() { return 1; }
+fg_path="$PATH"
+PATH="$fg_bin:$PATH"
+: > "$FG_WGET_LOG"
+download_subscription 'https://sub.example.com/sub?x=1#My%20VPN' "/tmp/fg-dl-$$" "" 1 0 5 "ua/test" 0 > /dev/null 2>&1
+expect_eq fg-download-drops-fragment "$(cat "$FG_WGET_LOG")" "https://sub.example.com/sub?x=1"
+: > "$FG_WGET_LOG"
+download_subscription 'https://sub.example.com/sub#My%20VPN' "/tmp/fg-dl-$$" "127.0.0.1:4534" 1 0 5 "ua/test" 0 > /dev/null 2>&1
+expect_eq fg-download-proxy-drops-fragment "$(cat "$FG_WGET_LOG")" "https://sub.example.com/sub"
+: > "$FG_WGET_LOG"
+check_subscription_connectivity 'https://sub.example.com/sub?x=1#My%20VPN' "" 1 0 5 > /dev/null 2>&1
+expect_eq fg-connectivity-drops-fragment "$(cat "$FG_WGET_LOG")" "https://sub.example.com/sub?x=1"
+PATH="$fg_path"
+rm -rf "$fg_bin" "$FG_WGET_LOG" "/tmp/fg-dl-$$"
 
 # ── Merge stamps the feed index ───────────────────────────────────
 feed_a="/tmp/fg-feed-a-$$.json"

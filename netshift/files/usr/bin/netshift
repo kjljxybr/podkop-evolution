@@ -165,9 +165,11 @@ has_outbound_section() {
 # section may now list MULTIPLE subscription_url entries; each feed keeps its
 # own independent download/UA/rejected/json cache keyed by this hash so the
 # feeds never collide and one bad feed cannot poison another. md5sum is
-# busybox-safe and the URL bytes are opaque user text (never parsed here).
+# busybox-safe and the URL bytes are opaque user text (never parsed here). The
+# #fragment is left out: it only names the feed on the dashboard and is never
+# fetched, so renaming a feed keeps its cache.
 get_subscription_url_hash() {
-    local url="$1"
+    local url="${1%%#*}"
 
     printf '%s' "$url" | md5sum 2>/dev/null | awk '{print $1}'
 }
@@ -2684,8 +2686,9 @@ sing_box_build_subscription_groups() {
 
 # Display name of one subscription feed, used for its own urltest group: the
 # URL fragment ("https://host/sub#My%20VPN" -> "My VPN") when there is one,
-# else the host. The fragment is never sent to the server (uclient-fetch, GNU
-# wget and curl all drop it). $2 is used when neither yields a name.
+# else the host. The fragment is cut off before any request is made
+# (download_subscription, check_subscription_connectivity) and is not part of
+# the cache hash. $2 is used when neither yields a name.
 get_subscription_feed_display_name() {
     local url="$1"
     local fallback="$2"
@@ -2693,7 +2696,7 @@ get_subscription_feed_display_name() {
 
     case "$url" in
     *'#'*)
-        name="$(url_decode_component "${url#*#}" | tr -d '\000-\037\177')"
+        name="$(url_decode_component "${url#*#}" | tr -d '\000-\037\177' | sed 's/^ *//; s/ *$//')"
         ;;
     esac
 
